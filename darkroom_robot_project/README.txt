@@ -79,7 +79,59 @@
 
 파일
   skills.py      스텝 정의 (속도·관절값·동작 설명)
-  main.py        명령줄 · 전체 파이프라인
+  main.py        명령줄 · 전체 파이프라인 (로봇이 붙은 PC에서 단독 실행)
   driver_sdk.py  STS3215 시리얼
   test.ipynb     연결 / 티칭 / 스텝별 실행
-  inspection.py  1·2차 검사·판정 (미구현)
+  inspection.py  1·2차 검사 + 아두이노 LED 조명
+  gui_server.py  PC/NUC 원격 버튼 UI (포트 8585)
+  robot_client.py  라즈베리파이 수신기 — 로봇팔·조명 실행
+
+하드웨어 연결 (원격 실행)
+
+  역할 분리
+    PC / NUC          버튼 GUI만. USB 장치 불필요
+    라즈베리파이      로봇팔 + 아두이노(LED) USB 연결, 실제 동작
+
+  PC / NUC
+    1. 라즈베리파이와 같은 유선/무선 네트워크
+    2. USB로 붙일 것 없음 (로봇·아두이노는 파이 쪽)
+    3. python gui_server.py 실행 → 포트 8585에서 대기
+    4. 방화벽이 8585를 막고 있으면 연다
+       (예: sudo ufw allow 8585/tcp)
+
+  라즈베리파이
+    USB1  SO-ARM101 (Feetech STS3215 보드)
+          → /dev/ttyACM0   skills.py PORT
+          전원 어댑터는 반드시 별도 연결 (USB만으로는 토크 부족)
+    USB2  아두이노 (조명 제어)
+          → /dev/ttyUSB0   inspection.py ARDUINO_PORT
+          아두이노가 ACM으로 잡히면 /dev/ttyACM1 일 수 있음
+          확인: ls /dev/ttyACM* /dev/ttyUSB*
+    아두이노 ↔ LED
+          펌웨어가 시리얼 명령 B:30 (밝기 30으로 켬), OFF (끄기)를 받는다
+          보드레이트 9600
+    시리얼 권한
+          sudo usermod -aG dialout $USER
+          로그아웃 후 다시 로그인해야 적용됨
+
+  네트워크
+    1. PC에서 ip addr 또는 ipconfig로 NUC IP 확인 (예: 192.168.0.10)
+    2. robot_client.py 의 HOST를 그 IP로 바꾼다
+       지금 기본값은 127.0.0.1 (같은 컴퓨터에서 테스트할 때만)
+    3. 파이에서 ping <NUC_IP> 가 되면 통신 준비 완료
+
+  실행 순서
+    1. PC   : python gui_server.py     (먼저 켜서 대기)
+    2. 파이 : python robot_client.py   (NUC에 접속)
+    3. GUI에 "라즈베리파이가 연결되었습니다" 가 뜨면 버튼 사용
+
+  포트가 바뀌었을 때
+    로봇이 ttyACM0이 아니면 skills.py PORT 수정
+    아두이노가 ttyUSB0이 아니면 inspection.py ARDUINO_PORT 수정
+    둘 다 꽂은 뒤 dmesg | tail 로 어느 장치가 어느 포트인지 확인
+
+단독 실행 (파이 없이, 로봇이 이 PC에 직접 붙은 경우)
+  로봇 USB → 이 PC의 /dev/ttyACM0
+  아두이노 USB → 이 PC의 /dev/ttyUSB0  (조명까지 쓸 때)
+  python test_ui.py  또는  python main.py
+  이 경우에는 gui_server / robot_client 를 쓰지 않는다

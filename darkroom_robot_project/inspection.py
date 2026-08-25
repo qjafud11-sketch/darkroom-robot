@@ -3,15 +3,37 @@ import serial
 import time
 
 # 아두이노 시리얼 통신 설정 (라즈베리파이에 연결된 포트, 리눅스 기본)
-try:
-    arduino = serial.Serial('/dev/ttyUSB0', 9600, timeout=1)
-    time.sleep(2) # 아두이노 재부팅 대기
-except Exception as e:
-    print(f"[경고] 아두이노 연결 실패 (조명 제어 무시됨): {e}")
-    arduino = None
+ARDUINO_PORT = '/dev/ttyUSB0'
+ARDUINO_BAUD = 9600
+RESET_WAIT = 2.0   # 포트를 열면 아두이노가 재부팅되므로 그만큼 기다린다
+
+_arduino = None
+_opened = False
+
+
+def _get_arduino():
+    """조명을 처음 쓸 때 포트를 연다.
+
+    import 시점에 열면 조명을 쓰지 않는 실행(main.py insert 등)에도
+    RESET_WAIT만큼 지연되고 포트를 붙잡게 되므로 실제 사용 시점까지 미룬다.
+    """
+    global _arduino, _opened
+    if _opened:
+        return _arduino
+
+    _opened = True
+    try:
+        _arduino = serial.Serial(ARDUINO_PORT, ARDUINO_BAUD, timeout=1)
+        time.sleep(RESET_WAIT)  # 아두이노 재부팅 대기
+    except Exception as e:
+        print(f"[경고] 아두이노 연결 실패 (조명 제어 무시됨): {e}")
+        _arduino = None
+    return _arduino
+
 
 def control_led(cmd):
     """아두이노로 시리얼 조명 명령 전달"""
+    arduino = _get_arduino()
     if arduino:
         if cmd == "LED_ON":
             arduino.write(b"B:30\n")  # 비전 검사용 밝기(30)로 켬
