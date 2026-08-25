@@ -1,0 +1,4 @@
+{
+  "python.defaultInterpreterPath": "${workspaceFolder}/darkroom_robot_project/.venv/bin/python",
+  "jupyter.jupyterServerType": "local"
+}

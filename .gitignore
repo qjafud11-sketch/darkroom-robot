@@ -1,0 +1,17 @@
+# 가상환경 — requirements.txt로 다시 설치하면 되므로 올리지 않음
+.venv/
+venv/
+
+# 파이썬 캐시
+__pycache__/
+*.pyc
+*.pyo
+
+# 노트북 체크포인트
+.ipynb_checkpoints/
+
+# 환경변수·자격증명
+.env
+.env.*
+*.pem
+*.key
