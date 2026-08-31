@@ -7,6 +7,7 @@ import time
 
 from arduino_link import resolve_port, resolve_servo_port, send_ok
 from camera import capture
+from servo import door_close, door_open
 from servo import home as servo_home
 from servo import rotate_180 as servo_rotate_180
 
@@ -35,6 +36,7 @@ def control_led(cmd):
 
 def _inspect(label):
     """조명 ON → 그 직후 촬영 → 켜진 지 2초가 안 됐으면 나머지를 채운 뒤 OFF."""
+    door_close()
     control_led("LED_ON")
     started = time.monotonic()
     capture(label)
@@ -42,6 +44,7 @@ def _inspect(label):
     if remain > 0:
         time.sleep(remain)
     control_led("LED_OFF")
+    door_open()
 
 
 def inspection_first():

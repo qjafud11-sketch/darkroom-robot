@@ -37,3 +37,13 @@ def rotate_90():
 def home():
     """촬영이 끝나면 18°로 되돌린다."""
     return _move(ANGLE_HOME, "원위치 18°")
+
+
+def door_open():
+    """자동문을 연다."""
+    return _move("open", "문 열기")
+
+
+def door_close():
+    """자동문을 닫는다."""
+    return _move("close", "문 닫기")
