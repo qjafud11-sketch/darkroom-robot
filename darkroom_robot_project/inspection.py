@@ -1,61 +1,79 @@
-"""암실 검사 — 카메라·센서 연동 시 이 파일만 구현하면 됩니다."""
-import serial
+"""암실 검사 — 투입/뒤집기 끝난 뒤 조명·카메라.
+
+조명은 FTDI 아두이노, 서보는 CH340 아두이노. PC가 둘 다 OK를 받은 뒤에만 다음으로 간다.
+조명이 켜진 뒤에 캡처하고, 저장이 끝나야 조명을 끈다.
+"""
 import time
 
-# 아두이노 시리얼 통신 설정 (라즈베리파이에 연결된 포트, 리눅스 기본)
-ARDUINO_PORT = '/dev/ttyUSB0'
-ARDUINO_BAUD = 9600
-RESET_WAIT = 2.0   # 포트를 열면 아두이노가 재부팅되므로 그만큼 기다린다
+from arduino_link import resolve_port, resolve_servo_port, send_ok
+from camera import capture
+from servo import home as servo_home
+from servo import rotate_180 as servo_rotate_180
 
-_arduino = None
-_opened = False
+LED_ON = "B:30"
+LED_OFF = "OFF"
+LIGHT_ON = 2.0
+SERVO_MOVE_GAP = 0
+LIGHT_DONE_GAP = 0
 
 
-def _get_arduino():
-    """조명을 처음 쓸 때 포트를 연다.
-
-    import 시점에 열면 조명을 쓰지 않는 실행(main.py insert 등)에도
-    RESET_WAIT만큼 지연되고 포트를 붙잡게 되므로 실제 사용 시점까지 미룬다.
-    """
-    global _arduino, _opened
-    if _opened:
-        return _arduino
-
-    _opened = True
-    try:
-        _arduino = serial.Serial(ARDUINO_PORT, ARDUINO_BAUD, timeout=1)
-        time.sleep(RESET_WAIT)  # 아두이노 재부팅 대기
-    except Exception as e:
-        print(f"[경고] 아두이노 연결 실패 (조명 제어 무시됨): {e}")
-        _arduino = None
-    return _arduino
+def _need(reply, board, command):
+    if reply is None:
+        raise ConnectionError(f"{board} 보드 미연결 — {command}")
+    return reply
 
 
 def control_led(cmd):
-    """아두이노로 시리얼 조명 명령 전달"""
-    arduino = _get_arduino()
-    if arduino:
-        if cmd == "LED_ON":
-            arduino.write(b"B:30\n")  # 비전 검사용 밝기(30)로 켬
-            print("💡 [조명] ON")
-        elif cmd == "LED_OFF":
-            arduino.write(b"OFF\n")   # 조명 끄기
-            print("💡 [조명] OFF")
+    """조명 켜기/끄기. FTDI 보드 OK를 기다린다."""
+    if cmd == "LED_ON":
+        print(f"[조명] ON  {resolve_port()}")
+        _need(send_ok(LED_ON), "조명", LED_ON)
+    elif cmd == "LED_OFF":
+        print(f"[조명] OFF  {resolve_port()}")
+        _need(send_ok(LED_OFF), "조명", LED_OFF)
+
+
+def _inspect(label):
+    """조명 ON → 그 직후 촬영 → 켜진 지 2초가 안 됐으면 나머지를 채운 뒤 OFF."""
+    control_led("LED_ON")
+    started = time.monotonic()
+    capture(label)
+    remain = LIGHT_ON - (time.monotonic() - started)
+    if remain > 0:
+        time.sleep(remain)
+    control_led("LED_OFF")
+
 
 def inspection_first():
-    """1차 검사 (투입 직후). 촬영·측정 코드를 넣을 자리."""
-    print("\n[검사] 1차 — 투입 완료 후")
-    control_led("LED_ON")
-    time.sleep(1.0) # 1초간 비전 검사 수행 대기
-    control_led("LED_OFF")
+    """1차 검사: 조명 ON(OK) → 촬영 저장(OK) → 조명 OFF(OK). 서보는 안 건드린다."""
+    print(f"\n[검사] 1차 — 투입 완료 후  조명 {resolve_port()}")
+    _inspect("1차")
 
 
 def inspection_second():
-    """2차 검사 (뒤집기 직후). 뒤집힌 샘플 확인."""
-    print("\n[검사] 2차 — 뒤집기 완료 후")
-    control_led("LED_ON")
-    time.sleep(1.0) # 1초간 비전 검사 수행 대기
-    control_led("LED_OFF")
+    """2차 검사: 서보 180° OK → 조명 ON·촬영·OFF OK → 서보 18°.
+
+    서보 CH340 D7, 조명 FTDI D8. 보드끼리 직접 말하지 않고 PC가 중계한다.
+    """
+    light_port = resolve_port()
+    servo_port = resolve_servo_port()
+    print(f"\n[검사] 2차 — 뒤집기 완료 후  서보 {servo_port}  조명 {light_port}")
+
+    print("[통신] PC → 서보  180°")
+    servo_rotate_180()
+    print("[통신] 서보 → PC  OK 180° → 조명")
+    if SERVO_MOVE_GAP > 0:
+        time.sleep(SERVO_MOVE_GAP)
+
+    print("[통신] PC → 조명  ON → 촬영 → OFF")
+    _inspect("2차")
+    print("[통신] 조명 → PC  OK OFF → 원위치")
+    if LIGHT_DONE_GAP > 0:
+        time.sleep(LIGHT_DONE_GAP)
+
+    print("[통신] PC → 서보  18°")
+    servo_home()
+    print("[통신] 서보 → PC  OK 18°")
 
 
 def judge_product():

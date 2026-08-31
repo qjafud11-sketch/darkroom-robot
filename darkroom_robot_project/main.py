@@ -1,6 +1,9 @@
 import argparse
 
-from inspection import inspection_first, inspection_second, judge_product
+from inspection import inspection_first, inspection_second
+from pipeline import run_ready_sequence
+from servo import home as servo_home
+from servo import rotate_180 as servo_rotate_180
 from skills import (
     set_grip_wait,
     set_speed_scale,
@@ -12,28 +15,25 @@ from skills import (
 
 
 def run():
-    """전체 파이프라인: 투입 → 1차검사 → 뒤집기 → 2차검사 → 판정 → 회수"""
-    print("\n########## 암실 검수 시작 ##########")
-    task_insert()
-    inspection_first()
-    task_flip()
-    inspection_second()
-    print(f"\n[판정] {judge_product()}")
-    task_bringout()
-    print("########## 완료 ##########\n")
+    """준비된 줄: 투입 → 1차검사 → 뒤집기 → 2차검사 → 회수. 판정·분류는 아직 없음."""
+    run_ready_sequence()
 
 
 TASKS = {
     "run": run,
     "insert": task_insert,
+    "inspect_1": inspection_first,
     "flip": task_flip,
+    "servo": servo_rotate_180,
+    "servo_home": servo_home,
+    "inspect_2": inspection_second,
     "bringout": task_bringout,
 }
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="암실 로봇 — insert(투입) / flip(뒤집기) / bringout(회수) / run(전체)",
+        description="암실 로봇 — insert / inspect_1 / flip / servo / servo_home / inspect_2 / bringout / run",
     )
     parser.add_argument("task", nargs="?", default="run", choices=list(TASKS))
     parser.add_argument(

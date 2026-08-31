@@ -32,6 +32,9 @@ JOINT_IDS = [1, 2, 3, 4, 5, 6]
 
 POS_MIN = 0
 POS_MAX = 4095
+# J1 수동 확인 범위. 서보 내부 제한을 변경하지 않고 명령값만 이 범위로 제한한다.
+J1_POS_MIN = 877
+J1_POS_MAX = 3286
 
 
 @dataclass
@@ -175,7 +178,11 @@ class STS3215Driver:
         return self._read_u16(servo_id, ADDR_PRESENT_POSITION)
 
     def set_position(self, servo_id: int, position: int) -> bool:
-        position = max(POS_MIN, min(POS_MAX, int(position)))
+        position = int(position)
+        if servo_id == 1:
+            position = max(J1_POS_MIN, min(J1_POS_MAX, position))
+        else:
+            position = max(POS_MIN, min(POS_MAX, position))
         return self._write_u16(servo_id, ADDR_GOAL_POSITION, position)
 
     def set_speed(self, servo_id: int, speed: int) -> bool:

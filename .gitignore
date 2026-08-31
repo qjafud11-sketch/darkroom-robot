@@ -15,3 +15,10 @@ __pycache__/
 .env.*
 *.pem
 *.key
+
+# 로컬 캐시·바이너리·촬영본 — 소스만 올린다
+darkroom_robot_project/.arduino-cli/
+darkroom_robot_project/.backups/
+darkroom_robot_project/captures/
+darkroom_robot_project/tools/
+darkroom_robot_project.zip
