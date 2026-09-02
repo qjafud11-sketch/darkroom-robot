@@ -15,6 +15,18 @@
 
 Servo myservo;
 
+// 자동문용 서보 2개. 거치대가 D8이라 문은 D9·D10.
+#define DOOR1_PIN 9
+#define DOOR2_PIN 10
+Servo door1;
+Servo door2;
+
+// 자동문 닫힘(정렬) 각도
+#define DOOR_CLOSE_ANGLE 90
+// 자동문 열림 각도 (서로 반대 방향)
+#define DOOR1_OPEN_ANGLE 180
+#define DOOR2_OPEN_ANGLE 0
+
 int angleToUs(int angle) {
   return map(angle, 0, 180, SERVO_MIN_US, SERVO_MAX_US);
 }
@@ -32,7 +44,13 @@ void setup() {
   Serial.begin(9600);
   myservo.attach(SERVO_PIN, SERVO_MIN_US, SERVO_MAX_US);
   moveTo(SERVO_HOME);
-  Serial.println("READY SERVO D8");
+
+  door1.attach(DOOR1_PIN);
+  door2.attach(DOOR2_PIN);
+  door1.write(DOOR1_OPEN_ANGLE);
+  door2.write(DOOR2_OPEN_ANGLE);
+
+  Serial.println("READY SERVO D8 DOOR D9/D10");
 }
 
 void loop() {
@@ -46,6 +64,23 @@ void loop() {
     return;
   }
 
+  // 문 개폐 명령어 처리
+  if (input == "open") {
+    door1.write(DOOR1_OPEN_ANGLE);
+    door2.write(DOOR2_OPEN_ANGLE);
+    delay(1000); // 문 움직이는 시간 대기
+    Serial.println("OK open");
+    return;
+  }
+  if (input == "close") {
+    door1.write(DOOR_CLOSE_ANGLE);
+    door2.write(DOOR_CLOSE_ANGLE);
+    delay(1000);
+    Serial.println("OK close");
+    return;
+  }
+
+  // 숫자면 거치대 각도 명령으로 간주
   bool digits = true;
   for (unsigned int i = 0; i < input.length(); i++) {
     if (input.charAt(i) < '0' || input.charAt(i) > '9') {
