@@ -3,7 +3,8 @@
 4대 중 하나를 골라 밝기·대비·노출·소프트웨어 선명을 맞춘다.
 C270은 고정 초점이라 초점 슬라이더가 없고, 선명·대비 필터로 가장자리를 살린다.
 USB 한계로 프리뷰는 고른 카메라 한 대만 연다.
-조명은 이 창에서 ON/OFF 한다 (FTDI, 검사와 동일 B:밝기).
+조명은 이 창에서 ON/OFF 한다 (FTDI NeoPixel D7, 검사와 동일 B:밝기).
+서보는 이 창에서 안 연다 (CH340 D8).
 원격 UI와 동시에 켜지 말 것 — 같은 카메라를 두고 싸운다.
 """
 from __future__ import annotations
@@ -16,10 +17,12 @@ from tkinter import DISABLED, NORMAL, Frame, Label, Canvas, Scrollbar
 
 from PIL import Image, ImageTk
 
-from arduino_link import resolve_port, send_ok
+from arduino_link import LIGHT_BRIGHTNESS, LIGHT_MAX, resolve_port, send_ok
+from light_tone import LIGHT_TONE_K, light_command
 from camera import CAMERAS, LiveCamera
 from camera_calib import (
     FILTER_DEFAULTS,
+    FILTER_LIMITS,
     GROUPS,
     apply_filters,
     filters_active,
@@ -27,6 +30,7 @@ from camera_calib import (
     list_controls,
     load_camera,
     load_filters,
+    restore_preset,
     save_camera,
     set_controls,
     sharpness_score,
@@ -45,6 +49,8 @@ class CalibUi:
         self.controls = []
         self.widgets = {}
         self.filter_values = dict(FILTER_DEFAULTS)
+        # 캘리브 창은 AI가 받을 그림을 봐야 필터를 맞출 수 있다. 그래서 여기만 보정본이 기본.
+        # 운영 UI(gui_server)는 반대로 카메라 기본값 화면을 보여준다.
         self.filter_preview = tk.BooleanVar(value=True)
         self._preview_filters = True
         self.score_var = tk.StringVar(value="선명도 점수  —")
@@ -54,7 +60,7 @@ class CalibUi:
         self.light_busy = False
         self._pending = None
         self.stopped = False
-        self.light_brightness = tk.StringVar(value="30")
+        self.light_brightness = tk.StringVar(value=str(LIGHT_BRIGHTNESS))
         self.status = tk.StringVar(value="카메라 1~4 중 한 대를 누르면 그 대만 켭니다.")
 
         self._build()
@@ -63,10 +69,22 @@ class CalibUi:
     def _build(self):
         top = Frame(self.root)
         top.pack(fill="x", padx=10, pady=(10, 4))
+        tk.Button(top, text="이 카메라 저장", width=14, height=2, bg="#fde68a", command=self.save).pack(
+            side="right", padx=4
+        )
+        tk.Button(top, text="저장값 불러오기", width=14, height=2, command=self.reload_saved).pack(
+            side="right", padx=4
+        )
+        tk.Button(top, text="장치 기본값", width=14, height=2, command=self.reset_defaults).pack(
+            side="right", padx=4
+        )
+        tk.Button(top, text="프리셋1 복원", width=14, height=2, command=self.restore_preset1).pack(
+            side="right", padx=4
+        )
         tk.Label(top, text="카메라 캘리브레이션", font=("Arial", 14, "bold")).pack(side="left")
         tk.Label(
             top,
-            text="한 대만 켜서 맞춥니다. 장치값·소프트웨어 선명은 검사 촬영에도 적용됩니다.",
+            text="한 대만 켜서 맞춥니다. 이 창은 AI가 받을 그림 기준입니다. 원본 사진은 보정 없이 따로 남습니다.",
             fg="#555",
         ).pack(side="left", padx=12)
 
@@ -89,13 +107,14 @@ class CalibUi:
         lights = Frame(self.root, bd=1, relief="groove")
         lights.pack(fill="x", padx=10, pady=(0, 6))
         tk.Label(lights, text="조명", font=("Arial", 10, "bold")).pack(side="left", padx=(8, 6), pady=8)
-        tk.Label(lights, text="밝기").pack(side="left")
-        tk.Entry(lights, textvariable=self.light_brightness, width=5).pack(side="left", padx=6)
         tk.Button(lights, text="켜기", width=8, height=1, bg="#fde68a", command=self.light_on).pack(side="left", padx=4)
         tk.Button(lights, text="끄기", width=8, height=1, command=self.light_off).pack(side="left", padx=4)
+        tk.Label(lights, text="  흰색 비교용 밝기").pack(side="left")
+        tk.Entry(lights, textvariable=self.light_brightness, width=5).pack(side="left", padx=6)
+        tk.Button(lights, text="흰색", width=6, height=1, command=self.light_white).pack(side="left", padx=4)
         tk.Label(
             lights,
-            text=f"FTDI {resolve_port()}  ·  검사와 동일 B:밝기 / OFF",
+            text=f"FTDI {resolve_port()}  ·  NeoPixel D7  ·  캘리브 기준 {LIGHT_TONE_K}K {light_command()}",
             fg="#555",
         ).pack(side="left", padx=10)
 
@@ -124,12 +143,11 @@ class CalibUi:
         canvas.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
 
-        btns = Frame(self.root)
-        btns.pack(fill="x", padx=10, pady=6)
-        tk.Button(btns, text="이 카메라 저장", width=14, height=2, bg="#fde68a", command=self.save).pack(side="left", padx=4)
-        tk.Button(btns, text="저장값 불러오기", width=14, height=2, command=self.reload_saved).pack(side="left", padx=4)
-        tk.Button(btns, text="장치 기본값", width=14, height=2, command=self.reset_defaults).pack(side="left", padx=4)
-        tk.Label(btns, textvariable=self.status, wraplength=620, justify="left").pack(side="left", padx=12)
+        status_row = Frame(self.root)
+        status_row.pack(fill="x", padx=10, pady=6)
+        tk.Label(status_row, textvariable=self.status, wraplength=1400, justify="left").pack(
+            side="left", padx=4
+        )
 
     def select(self, cam):
         self.selected = cam
@@ -204,24 +222,28 @@ class CalibUi:
         )
         tk.Label(
             box,
-            text="초점을 못 바꿀 때 가장자리와 대비를 살립니다. 저장하면 검사 사진에도 들어갑니다.",
+            text=(
+                "검출기(YOLO 등)가 결함을 구분하기 쉽게 미는 값입니다. "
+                "이 프리뷰와 원본 사진에는 안 들어가고, AI가 읽을 보정본(_ai.jpg)에만 들어갑니다. "
+                "선명 범위는 결함 굵기에 맞춥니다 — 10px 결함이면 10.0 근처."
+            ),
             fg="#666",
             wraplength=360,
             justify="left",
         ).pack(anchor="w", padx=8, pady=(0, 4))
         tk.Checkbutton(
             box,
-            text="보정 미리보기 (끄면 원본과 비교)",
+            text="AI가 받을 그림으로 보기 (끄면 원본과 비교)",
             variable=self.filter_preview,
             command=self._sync_preview_flag,
         ).pack(anchor="w", padx=8)
         tk.Label(box, textvariable=self.score_var).pack(anchor="w", padx=8, pady=(2, 6))
 
         specs = (
-            ("unsharp", "소프트웨어 선명", 0, 250, 1, None),
-            ("unsharp_radius", "선명 범위", 5, 40, 1, "radius"),
-            ("local_contrast", "대비 보정", 0, 80, 1, None),
-            ("denoise", "노이즈 완화", 0, 5, 1, None),
+            ("unsharp", "소프트웨어 선명", 0, FILTER_LIMITS["unsharp"], 10, None),
+            ("unsharp_radius", "선명 범위", 5, FILTER_LIMITS["unsharp_radius"], 5, "radius"),
+            ("local_contrast", "대비 보정", 0, FILTER_LIMITS["local_contrast"], 1, None),
+            ("denoise", "노이즈 완화", 0, FILTER_LIMITS["denoise"], 1, None),
         )
         for name, label, lo, hi, step, kind in specs:
             row = Frame(box)
@@ -401,6 +423,20 @@ class CalibUi:
         except Exception as exc:
             self.status.set(f"불러오기 실패: {exc}")
 
+    def restore_preset1(self):
+        """프리셋1을 네 대 모두 되돌리고, 지금 보는 카메라에 바로 넣는다."""
+        try:
+            ids = restore_preset("1")
+        except KeyError as exc:
+            self.status.set(str(exc))
+            return
+        cam = self.selected
+        if cam is None or not cam.get("device"):
+            self.status.set(f"프리셋1 복원 (카메라 {', '.join(ids)}). 카메라를 고르면 화면에 반영됩니다.")
+            return
+        self.reload_saved()
+        self.status.set(f"프리셋1 복원 (카메라 {', '.join(ids)}). {cam['name']} 화면에 반영했습니다.")
+
     def reset_defaults(self):
         cam = self.selected
         if cam is None or not cam.get("device"):
@@ -415,13 +451,19 @@ class CalibUi:
             self.status.set(f"기본값 실패: {exc}")
 
     def light_on(self):
+        """캘리브 기준 톤으로 켠다. 검사와 같은 빛에서 맞춰야 값이 맞는다."""
+        command = light_command()
+        self._send_light(command, f"조명 켜짐 {LIGHT_TONE_K}K {command}")
+
+    def light_white(self):
+        """예전 흰색. 톤 효과를 비교해 볼 때만 쓴다."""
         try:
             value = int(self.light_brightness.get())
         except ValueError:
             self.status.set("조명 밝기는 숫자로 입력하세요.")
             return
-        value = max(0, min(80, value))
-        self._send_light(f"B:{value}", f"조명 켜짐 B:{value}")
+        value = max(0, min(LIGHT_MAX, value))
+        self._send_light(f"B:{value}", f"흰색 B:{value} (비교용)")
 
     def light_off(self):
         self._send_light("OFF", "조명 꺼짐")

@@ -16,6 +16,7 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox
 
+from arduino_link import LIGHT_BRIGHTNESS, LIGHT_MAX
 from camera import CAMERAS as CAM_SLOTS
 
 
@@ -23,7 +24,7 @@ PI_HOST = "127.0.0.1"
 PI_LIGHT_PORT = 9001
 CAPTURE_DIR = Path(__file__).resolve().parent / "captures"
 CAMERAS = tuple((cam["name"], cam["device"]) for cam in CAM_SLOTS if cam.get("device"))
-# 점등 비교로 확인한 실제 방향 순서. 괄호의 R 번호는 D8 체인의 물리 링 번호다.
+# 점등 비교로 확인한 실제 방향 순서. 괄호의 R 번호는 D7 체인의 물리 링 번호다.
 LIGHTS = (
     ("전체 조명", "B:{brightness}", "OFF"),
     ("카메라 1 방향 조명", "R2:{brightness}", "R2:0"),
@@ -199,7 +200,7 @@ class CameraLightUi:
         self.light_var = tk.IntVar(value=0)
         self.host_var = tk.StringVar(value=PI_HOST)
         self.port_var = tk.StringVar(value=str(PI_LIGHT_PORT))
-        self.brightness_var = tk.IntVar(value=30)
+        self.brightness_var = tk.IntVar(value=LIGHT_BRIGHTNESS)
         self.settle_var = tk.StringVar(value="2.0")
         self.status_var = tk.StringVar(value="카메라를 연결하는 중...")
         self.metric_var = tk.StringVar(value="밝기 측정값: -")
@@ -249,7 +250,8 @@ class CameraLightUi:
         setting_box = tk.LabelFrame(controls, text="3. 밝기와 대기", padx=8, pady=6, bg="#f3f4f6")
         setting_box.pack(fill="x", pady=(0, 10))
         tk.Scale(
-            setting_box, label="밝기 (안전 상한 80)", from_=0, to=80, orient="horizontal",
+            setting_box, label=f"밝기 (안전 상한 {LIGHT_MAX}, 캘리브 기준 {LIGHT_BRIGHTNESS})",
+            from_=0, to=LIGHT_MAX, orient="horizontal",
             variable=self.brightness_var, length=250, bg="#f3f4f6",
         ).pack(fill="x")
         wait_row = tk.Frame(setting_box, bg="#f3f4f6")

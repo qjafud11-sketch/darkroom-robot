@@ -1,13 +1,17 @@
 #include <Servo.h>
 
-// 서보 전용 아두이노 (CH340). 조명 보드(FTDI D8)와 파이 시리얼은 쓰지 않는다.
-// PC: "18\n" / "180\n" → "OK <각도>". 원위치(기본)는 18°.
-// 주황=D7, 갈=GND, 빨강=5V (가능하면 USB가 아닌 별도 5V)
-#define SERVO_HOME 18
-#define SERVO_PIN 7
-#define SERVO_MIN_US 1000
-#define SERVO_MAX_US 2000
-#define SERVO_WAIT_MS 1000
+// 서보 전용 아두이노 (CH340). 조명 보드(FTDI D7)와 파이 시리얼은 쓰지 않는다.
+// PC: "0\n" / "180\n" → "OK <각도>". 원위치(기본)는 0°.
+// 주황=D8, 갈=GND, 빨강=5V (가능하면 USB가 아닌 별도 5V)
+// 원위치를 18°에서 0°로 내렸다. 펄스 상한이 이미 스톨 직전이라 더 못 넓히는데,
+// 시작점을 내리면 펄스를 안 건드리고 회전량을 162°에서 180°로 늘릴 수 있다.
+#define SERVO_HOME 0
+#define SERVO_PIN 8
+// 1000~2000µs는 실제 ~90°. 500~2620은 끝에서 걸릴 수 있어
+// 붙인 채로 550~2520을 쓴다 (2500보다 조금 더, 스톨 직전).
+#define SERVO_MIN_US 550
+#define SERVO_MAX_US 2520
+#define SERVO_WAIT_MS 2000
 
 Servo myservo;
 
@@ -16,15 +20,19 @@ int angleToUs(int angle) {
 }
 
 void moveTo(int angle) {
-  myservo.attach(SERVO_PIN, SERVO_MIN_US, SERVO_MAX_US);
-  myservo.writeMicroseconds(angleToUs(angle));
+  int us = angleToUs(angle);
+  digitalWrite(LED_BUILTIN, HIGH);
+  myservo.writeMicroseconds(us);
   delay(SERVO_WAIT_MS);
+  digitalWrite(LED_BUILTIN, LOW);
 }
 
 void setup() {
+  pinMode(LED_BUILTIN, OUTPUT);
   Serial.begin(9600);
+  myservo.attach(SERVO_PIN, SERVO_MIN_US, SERVO_MAX_US);
   moveTo(SERVO_HOME);
-  Serial.println("READY SERVO D7");
+  Serial.println("READY SERVO D8");
 }
 
 void loop() {

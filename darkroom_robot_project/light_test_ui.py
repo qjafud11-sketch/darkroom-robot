@@ -3,7 +3,7 @@ import threading
 import tkinter as tk
 from tkinter import StringVar
 
-from arduino_link import resolve_port, send_ok
+from arduino_link import LIGHT_BRIGHTNESS, LIGHT_MAX, resolve_port, send_ok
 
 
 class LightTestUi:
@@ -13,14 +13,18 @@ class LightTestUi:
         self.root.geometry("400x260")
 
         self.port = resolve_port()
-        self.brightness = StringVar(value="30")
+        self.brightness = StringVar(value=str(LIGHT_BRIGHTNESS))
         self.status = StringVar(
             value=f"포트 {self.port}\n켜기를 누르면 조명 보드에 B:밝기를 보냅니다. 서보는 안 움직입니다."
         )
         self.busy = False
 
-        tk.Label(self.root, text="조명만 테스트 (FTDI 아두이노 · D8 · NeoPixel)", font=("Arial", 12, "bold")).pack(pady=(14, 4))
-        tk.Label(self.root, text="켜기 = B:밝기    끄기 = OFF    검사 기본 밝기 30", fg="#555").pack()
+        tk.Label(self.root, text="조명만 테스트 (FTDI 아두이노 · D7 · NeoPixel)", font=("Arial", 12, "bold")).pack(pady=(14, 4))
+        tk.Label(
+            self.root,
+            text=f"켜기 = B:밝기    끄기 = OFF    검사·캘리브 기준 밝기 {LIGHT_BRIGHTNESS}",
+            fg="#555",
+        ).pack()
 
         row = tk.Frame(self.root)
         row.pack(pady=12)
@@ -55,7 +59,7 @@ class LightTestUi:
         except ValueError:
             self.status.set("밝기는 숫자로 입력하세요.")
             return
-        value = max(0, min(80, value))
+        value = max(0, min(LIGHT_MAX, value))
         self._send(f"B:{value}", f"켜짐 B:{value}")
 
     def turn_off(self):

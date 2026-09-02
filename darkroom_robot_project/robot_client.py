@@ -2,13 +2,10 @@ import json
 import socket
 
 from hw_ports import report as report_ports
-from pipeline import run_step
+from pipeline import PIPELINE_COMMANDS, get_ui_snapshot, run_step
 
 HOST = "127.0.0.1"  # 로컬 테스트 시 127.0.0.1, 실제 NUC가 다른 PC라면 해당 IP로 변경
 PORT = 8585
-
-# UI가 보내는 준비된 명령. 집기·판정·분류·완료 보고·캘리브(11)·AI(12)는 아직 없다.
-READY_COMMANDS = ("PING", "INSERT", "INSPECT_1", "FLIP", "SERVO", "INSPECT_2", "BRINGOUT", "GAP", "CALIB", "AI")
 
 
 def handle_command(command):
@@ -17,7 +14,7 @@ def handle_command(command):
     한 단계가 끝나야 DONE을 보낸다. 다음 단계는 UI가 그 신호를 받은 뒤에 온다.
     """
     try:
-        if command in READY_COMMANDS:
+        if command in PIPELINE_COMMANDS:
             return run_step(command)
 
         print(f" 알 수 없는 명령: {command}")
@@ -53,9 +50,12 @@ def run_client():
                 response = {
                     "status": status,
                     "message": reply_msg,
+                    "command": command,
                 }
+                if status == "DONE":
+                    response.update(get_ui_snapshot())
                 print(f"[실행기 송신] {status} — {reply_msg}")
-                s.sendall((json.dumps(response) + "\n").encode("utf-8"))
+                s.sendall((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
 
         except ConnectionRefusedError:
             print("[실행기] 연결 실패. gui_server.py가 켜져 있는지 확인하세요.")

@@ -1,4 +1,6 @@
 pyserial>=3.5
+pillow>=10.0
+numpy>=1.26          # calib_score 측정용. 촬영·보정 경로는 pillow만 쓴다.
 jupyter>=1.0
 ipykernel==6.29.5
 jupyter_client==8.6.3

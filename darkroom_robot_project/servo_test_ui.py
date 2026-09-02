@@ -19,16 +19,16 @@ class ServoTestUi:
         self.angle = StringVar(value="180")
         self.busy = False
 
-        tk.Label(self.root, text="서보만 테스트 (CH340 아두이노 · D7 · SG90)", font=("Arial", 12, "bold")).pack(pady=(14, 4))
+        tk.Label(self.root, text="서보만 테스트 (CH340 아두이노 · D8 · SG90)", font=("Arial", 12, "bold")).pack(pady=(14, 4))
         tk.Label(
             self.root,
-            text="주황=서보보드 D7  갈=GND  빨강=별도 5V   조명 보드 아님",
+            text="주황=서보보드 D8  갈=GND  빨강=별도 5V   조명 보드 아님",
             fg="#555",
         ).pack()
 
         row = tk.Frame(self.root)
         row.pack(pady=12)
-        tk.Button(row, text="원위치 18°", width=12, height=2, command=lambda: self._go(ANGLE_HOME)).pack(side="left", padx=8)
+        tk.Button(row, text="원위치 0°", width=12, height=2, command=lambda: self._go(ANGLE_HOME)).pack(side="left", padx=8)
         tk.Button(row, text="180°", width=12, height=2, bg="#fde68a", command=lambda: self._go(ANGLE_180)).pack(side="left", padx=8)
 
         custom = tk.Frame(self.root)

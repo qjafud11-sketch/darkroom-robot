@@ -1,7 +1,7 @@
 """PC ↔ 아두이노 두 대.
 
-조명: FTDI A5069RR4, NeoPixel D8
-서보: CH340, SG90 D7 (배너 READY SERVO)
+조명: FTDI A5069RR4, NeoPixel D7
+서보: CH340, SG90 D8 (배너 READY SERVO)
 여분 CH340(허브 5.2)과 로봇팔 ACM은 열지 않는다.
 """
 from pathlib import Path
@@ -9,16 +9,25 @@ from pathlib import Path
 import serial
 import time
 
-from hw_ports import EXTRA_CH340_BY_PATH, LIGHT_BY_ID, resolve_servo_candidates
+from hw_ports import EXTRA_CH340_BY_PATH, LIGHT_BY_ID, LIGHT_FALLBACK, resolve_servo_candidates
 
 BAUD = 9600
 RESET_WAIT = 2.5
 REPLY_TIMEOUT = 2.0
 MOVE_WAIT = 0.5
+# 포트를 열면 보드가 리셋된다. RESET_WAIT 만으로 배너를 못 받는 경우가 있어서
+# 배너 글자를 볼 때까지 이만큼 더 기다린다. 첫 연결에서만 든다.
+BANNER_WAIT = 3.0
+
+# 조명 밝기. 카메라 캘리브를 이 밝기에서 맞췄으니 검사도 테스트 UI도 같은 값을 써야 한다.
+# 다른 밝기로 켜고 보면 캘리브한 노출과 안 맞는다.
+# LIGHT_MAX 는 펌웨어의 MAX_BRIGHTNESS 와 같아야 한다.
+LIGHT_MAX = 80
+LIGHT_BRIGHTNESS = 80
 
 LIGHT_CANDIDATES = (
     LIGHT_BY_ID,
-    "/dev/ttyUSB2",
+    LIGHT_FALLBACK,
 )
 
 CONSOLE_MARKERS = ("login:", "Debian", "raspberrypi", "ttyAMA")
@@ -65,18 +74,28 @@ class ArduinoBoard:
         return seen
 
     def _open_one(self, port):
+        """포트를 열고 부팅 배너를 다 받아낸다.
+
+        배너를 흘리면 다음에 보내는 첫 명령의 응답 자리에 배너가 들어온다.
+        서보에서 그러면 안 돌았는데 OK 로 보인다. 그래서 배너를 볼 때까지 기다린다.
+        """
         ser = serial.Serial(port, BAUD, timeout=0.2)
         time.sleep(RESET_WAIT)
         buf = bytearray()
         idle = 0
-        while idle < 6:
+        deadline = time.monotonic() + BANNER_WAIT
+        while True:
             waiting = ser.in_waiting
             if waiting:
                 buf.extend(ser.read(waiting))
                 idle = 0
-            else:
-                idle += 1
-                time.sleep(0.05)
+                continue
+            if self.ready_hint and self.ready_hint in buf.decode("ascii", errors="replace"):
+                break
+            idle += 1
+            if idle >= 6 and time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
         leftover = buf.decode("ascii", errors="replace").strip()
         return ser, leftover
 
@@ -129,26 +148,37 @@ class ArduinoBoard:
             return None
 
         line = command.strip()
-        ser.reset_input_buffer()
-        ser.write((line + "\n").encode("ascii"))
-        ser.flush()
-        print(f"[{self.name}] → {line}")
+        # READY 는 부팅 배너지 명령 응답이 아니다. 그걸 OK 로 받으면
+        # 부팅 중에 삼켜진 명령을 성공으로 착각한다. 배너를 보면 한 번 다시 보낸다.
+        for attempt in range(2):
+            ser.reset_input_buffer()
+            ser.write((line + "\n").encode("ascii"))
+            ser.flush()
+            print(f"[{self.name}] → {line}")
 
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            raw = ser.readline()
-            if not raw:
-                continue
-            reply = raw.decode("ascii", errors="replace").strip()
-            if not reply:
-                continue
-            print(f"[{self.name}] ← {reply}")
-            if any(mark in reply for mark in CONSOLE_MARKERS):
-                raise RuntimeError(f"{self.name} 포트가 해당 아두이노가 아닙니다: {self.port}")
-            if reply.startswith("ERR"):
-                raise RuntimeError(f"{self.name} 거부: {reply} (명령 {line})")
-            if reply.startswith("OK") or reply.startswith("READY"):
-                return reply
+            booted = False
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                raw = ser.readline()
+                if not raw:
+                    continue
+                reply = raw.decode("ascii", errors="replace").strip()
+                if not reply:
+                    continue
+                print(f"[{self.name}] ← {reply}")
+                if any(mark in reply for mark in CONSOLE_MARKERS):
+                    raise RuntimeError(f"{self.name} 포트가 해당 아두이노가 아닙니다: {self.port}")
+                if reply.startswith("ERR"):
+                    raise RuntimeError(f"{self.name} 거부: {reply} (명령 {line})")
+                if reply.startswith("OK"):
+                    return reply
+                if reply.startswith("READY"):
+                    booted = True
+                    break
+
+            if not (booted and attempt == 0):
+                break
+            print(f"[{self.name}] 방금 부팅한 보드였음 — 다시 보냄")
 
         if not must_reply:
             print(f"[{self.name}] OK 없음 — {MOVE_WAIT}초 대기 후 진행")

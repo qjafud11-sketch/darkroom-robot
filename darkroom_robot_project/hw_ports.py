@@ -9,16 +9,17 @@ import re
 
 ARM_BY_ID = "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B61033773-if00"
 LIGHT_BY_ID = "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_A5069RR4-if00-port0"
-SERVO_BY_PATH = "/dev/serial/by-path/pci-0000:80:14.0-usb-0:2.3:1.0-port0"
+SERVO_BY_PATH = "/dev/serial/by-path/pci-0000:80:14.0-usb-0:2.2:1.0-port0"
 # 조명·서보가 아닌 여분 CH340 (허브 5.2). 아두이노 후보에서 뺀다.
 EXTRA_CH340_BY_PATH = "/dev/serial/by-path/pci-0000:80:14.0-usb-0:5.2:1.0-port0"
+LIGHT_FALLBACK = "/dev/ttyUSB1"
 
 # 물리 자리가 바뀌지 않으면 번호도 유지. 나머지는 빈 번호부터 채운다.
 PREFERRED_USB = {
     "2.4.1": 1,
     "2.4.2": 2,
     "2.4.3": 3,
-    "2.2": 4,
+    "2.3": 4,
 }
 
 USB_RE = re.compile(r"usb-0:([^:]+):")
@@ -47,7 +48,7 @@ def resolve_arm_port():
 
 
 def resolve_light_port():
-    found = _existing((LIGHT_BY_ID, "/dev/ttyUSB2"))
+    found = _existing((LIGHT_BY_ID, LIGHT_FALLBACK))
     return found[0] if found else LIGHT_BY_ID
 
 
@@ -59,7 +60,10 @@ def resolve_servo_candidates():
     if Path(EXTRA_CH340_BY_PATH).exists():
         extra = str(Path(EXTRA_CH340_BY_PATH).resolve())
     seen = []
-    for path in sorted(Path("/dev").glob("ttyUSB*")):
+    for candidate in (SERVO_BY_PATH, *sorted(Path("/dev").glob("ttyUSB*"), key=lambda p: p.name)):
+        path = Path(candidate)
+        if not path.exists():
+            continue
         resolved = str(path.resolve())
         if resolved in seen or resolved == light or resolved == extra:
             continue

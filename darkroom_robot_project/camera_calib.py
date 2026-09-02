@@ -3,13 +3,18 @@
 값은 ~/darkroom_calib.json 에 카메라 id 별로 남긴다.
 상황 바뀔 때마다 UI에서 다시 맞추면 된다.
 지금 달린 C270은 고정 초점이라 초점 슬라이더가 없다.
-대신 소프트웨어 선명·대비를 저장해 검사 사진에도 넣는다.
+대신 소프트웨어 선명·대비를 저장해 검사 사진 옆에 보정본(cam2_ai.jpg)으로 남긴다.
+원본은 그대로 두므로, 보정값을 바꿔도 다시 찍지 않고 보정본만 다시 만들면 된다.
+
+이 값들은 사람 눈이 아니라 검출기(YOLO 등) 기준으로 맞춘 것이다.
+분리도를 숫자로 보려면 calib_score / calib_probe 를 쓴다.
 """
 from __future__ import annotations
 
 import json
 import re
 import subprocess
+from datetime import datetime
 from pathlib import Path
 
 from PIL import Image, ImageEnhance, ImageFilter, ImageStat
@@ -107,6 +112,7 @@ def list_controls(device):
                 "default": fields.get("default", fields.get("value", 0)),
                 "value": fields.get("value", fields.get("default", 0)),
                 "inactive": "inactive" in flags,
+                "read_only": "read-only" in flags,
                 "menus": {},
             }
             continue
@@ -165,6 +171,15 @@ FILTER_DEFAULTS = {
     "denoise": 0,
 }
 
+# 흠집 검출용으로 실측하다 보니 예전 상한(선명 250, 범위 4.0px)이 모자랐다.
+# 흠집 폭이 10px쯤이라 그만한 범위로 세게 밀어야 검출기 쪽 분리도가 올라간다.
+FILTER_LIMITS = {
+    "unsharp": 700,
+    "unsharp_radius": 200,
+    "local_contrast": 80,
+    "denoise": 5,
+}
+
 
 def _clamp(value, lo, hi, default=0):
     try:
@@ -177,10 +192,10 @@ def _clamp(value, lo, hi, default=0):
 def normalize_filters(values=None):
     src = values or {}
     return {
-        "unsharp": _clamp(src.get("unsharp"), 0, 250, 0),
-        "unsharp_radius": _clamp(src.get("unsharp_radius"), 5, 40, 15),
-        "local_contrast": _clamp(src.get("local_contrast"), 0, 80, 0),
-        "denoise": _clamp(src.get("denoise"), 0, 5, 0),
+        "unsharp": _clamp(src.get("unsharp"), 0, FILTER_LIMITS["unsharp"], 0),
+        "unsharp_radius": _clamp(src.get("unsharp_radius"), 5, FILTER_LIMITS["unsharp_radius"], 15),
+        "local_contrast": _clamp(src.get("local_contrast"), 0, FILTER_LIMITS["local_contrast"], 0),
+        "denoise": _clamp(src.get("denoise"), 0, FILTER_LIMITS["denoise"], 0),
     }
 
 
@@ -245,6 +260,72 @@ def load_camera(cam_id):
     return dict(item.get("controls") or {})
 
 
+def _write_store(store):
+    CALIB_PATH.write_text(json.dumps(store, ensure_ascii=False, indent=2), encoding="utf-8")
+    return CALIB_PATH
+
+
+def save_preset(name, note=""):
+    """지금 저장된 네 대 캘리브를 프리셋으로 떠 둔다.
+
+    기본값으로 되돌려 다시 맞출 때, 되돌리기 전 값을 잃지 않으려고 쓴다.
+    프리셋은 같은 파일 안에 따로 들어가므로 cameras 를 덮어도 남는다.
+    """
+    store = load_store()
+    presets = store.setdefault("presets", {})
+    presets[str(name)] = {
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+        "note": note,
+        "cameras": json.loads(json.dumps(store.get("cameras", {}))),
+    }
+    return _write_store(store)
+
+
+def list_presets():
+    store = load_store()
+    return {
+        key: {"saved_at": item.get("saved_at", ""), "note": item.get("note", "")}
+        for key, item in (store.get("presets") or {}).items()
+    }
+
+
+def restore_preset(name):
+    """프리셋을 현재 캘리브 자리로 되돌린다. 프리셋 자체는 남는다."""
+    store = load_store()
+    preset = (store.get("presets") or {}).get(str(name))
+    if not preset:
+        raise KeyError(f"프리셋 {name} 이 없습니다.")
+    store["cameras"] = json.loads(json.dumps(preset.get("cameras", {})))
+    _write_store(store)
+    return sorted(store["cameras"])
+
+
+def reset_saved_to_defaults(cam_id, device):
+    """저장값을 장치 기본값 + 필터 끄기로 되돌리고 장치에도 넣는다.
+
+    UI의 '장치 기본값' 버튼은 화면만 되돌리고 저장은 안 한다.
+    여기서는 파일까지 바꿔서, 창을 다시 열어도 기본값으로 뜨게 한다.
+    """
+    if not device:
+        return None
+    live = list_controls(device)
+    if not live:
+        return None
+    saved = load_camera(cam_id)
+    # 예전에 저장했던 항목만 기본값으로 되돌린다. 초점·줌까지 끌어오면
+    # 저장 파일 모양이 프리셋과 달라져 나중에 비교하기 나쁘다.
+    names = set(saved) or {item["name"] for item in live}
+    defaults = {
+        item["name"]: item["default"]
+        for item in live
+        if item["name"] in names and not item.get("read_only")
+    }
+    stored = load_store().get("cameras", {}).get(str(cam_id), {})
+    save_camera(cam_id, device, defaults, stored.get("name", ""), FILTER_DEFAULTS)
+    set_controls(device, defaults)
+    return defaults
+
+
 def load_filters(cam_id):
     store = load_store()
     item = store.get("cameras", {}).get(str(cam_id), {})
@@ -260,12 +341,57 @@ def apply_saved(cam_id, device):
     return True
 
 
-def apply_saved_filters(cam_id, path):
-    """저장된 소프트웨어 보정을 JPEG에 덮어쓴다. 값이 없으면 그대로 둔다."""
+def apply_defaults(device):
+    """드라이버 기본값으로 되돌린다. 운영 UI 프리뷰가 이 상태로 보인다.
+
+    캘리브 값은 검출기용이라 사람이 보기엔 어둡고 흑백이다.
+    그래서 화면은 기본값(자동 노출·자동 화이트밸런스)으로 두고,
+    촬영 직전에만 apply_saved 로 바꿔 찍는다.
+    """
+    if not device:
+        return False
+    values = {
+        item["name"]: item["default"]
+        for item in list_controls(device)
+        if not item.get("read_only") and isinstance(item.get("default"), int)
+    }
+    if not values:
+        return False
+    set_controls(device, values)
+    return True
+
+
+def ai_path(path):
+    source = Path(path)
+    return source.with_name(f"{source.stem}_ai{source.suffix}")
+
+
+def save_filtered_in_place(cam_id, path):
+    """보정본 한 장만 남긴다. 원본 자리에 덮어쓴다.
+
+    어노테이션용 데이터셋은 판독 때와 같은 그림 한 장이면 된다.
+    원본까지 남기면 장수가 두 배가 되고 어느 쪽에 상자를 쳤는지 헷갈린다.
+    검사 촬영은 반대로 원본을 남겨야 하니 save_ai_copy 를 쓴다.
+    """
     filters = load_filters(cam_id)
     if not filters_active(filters):
         return False
-    dest = Path(path)
-    image = Image.open(dest).convert("RGB")
-    apply_filters(image, filters).save(dest, quality=95, subsampling=0)
+    image = Image.open(path).convert("RGB")
+    apply_filters(image, filters).save(path, quality=95, subsampling=0)
     return True
+
+
+def save_ai_copy(cam_id, path):
+    """보정본을 옆에 따로 남긴다. 원본은 건드리지 않는다.
+
+    예전에는 원본 JPEG을 덮어썼는데, 보정값을 바꾸면 다시 찍어야 했다.
+    학습·어노테이션은 보정본을, 재보정은 원본을 쓰면 된다.
+    """
+    filters = load_filters(cam_id)
+    if not filters_active(filters):
+        return None
+    source = Path(path)
+    dest = ai_path(source)
+    image = Image.open(source).convert("RGB")
+    apply_filters(image, filters).save(dest, quality=95, subsampling=0)
+    return dest
