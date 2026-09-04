@@ -4,3 +4,10 @@ numpy>=1.26          # calib_score 측정용. 촬영·보정 경로는 pillow만
 jupyter>=1.0
 ipykernel==6.29.5
 jupyter_client==8.6.3
+torch>=2.4           # 비지도 PatchCore. CPU 휠 권장.
+torchvision>=0.19
+anomalib>=2.0        # 면별 이상탐지 학습·추론
+ultralytics>=8.3     # 크롭 YOLO (스크래치·찌그러짐)
+datumaro>=1.8        # Roboflow COCO → Geti Datumaro 변환
+openvino>=2024.0     # Geti 샘플 면 분할
+

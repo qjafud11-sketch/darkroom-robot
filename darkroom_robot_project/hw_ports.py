@@ -7,7 +7,12 @@ index1은 메타데이터라 화면이 안 나온다.
 from pathlib import Path
 import re
 
-ARM_BY_ID = "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B61033773-if00"
+# 최신 스킬셋 보드(시리얼 번호 있는 CH340)를 먼저 보고, 이 PC에 있는 기존 이름도 받는다.
+ARM_BY_IDS = (
+    "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B61033773-if00",
+    "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0",
+)
+ARM_BY_ID = ARM_BY_IDS[0]
 LIGHT_BY_ID = "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_A5069RR4-if00-port0"
 SERVO_BY_PATH = "/dev/serial/by-path/pci-0000:80:14.0-usb-0:2.2:1.0-port0"
 # 조명·서보가 아닌 여분 CH340 (허브 5.2). 아두이노 후보에서 뺀다.
@@ -38,13 +43,18 @@ def _existing(candidates):
 
 
 def resolve_arm_port():
-    found = _existing((ARM_BY_ID,))
+    skip = set()
+    if Path(LIGHT_BY_ID).exists():
+        skip.add(str(Path(LIGHT_BY_ID).resolve()))
+    if Path(SERVO_BY_PATH).exists():
+        skip.add(str(Path(SERVO_BY_PATH).resolve()))
+    found = [path for path in _existing(ARM_BY_IDS) if path not in skip]
     if found:
         return found[0]
     acms = sorted(Path("/dev").glob("ttyACM*"), key=lambda p: p.name)
     if acms:
         return str(acms[0])
-    return ARM_BY_ID
+    return ARM_BY_IDS[0]
 
 
 def resolve_light_port():

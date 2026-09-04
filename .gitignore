@@ -22,3 +22,12 @@ darkroom_robot_project/.backups/
 darkroom_robot_project/captures/
 darkroom_robot_project/tools/
 darkroom_robot_project.zip
+
+# 데이터셋·가중치 — 용량이 커서 올리지 않음
+*.pt
+weights/
+darkroom_robot_project/train/
+darkroom_robot_project/valid/
+darkroom_robot_project/test/
+darkroom_robot_project/roboflow.zip
+darkroom_robot_project/time

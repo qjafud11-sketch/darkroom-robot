@@ -22,7 +22,7 @@ SETTINGS_PATH = Path.home() / "darkroom_ui_settings.json"
 
 DEFAULT_SETTINGS = {
     "judge_backend": "stub",
-    "judge_score_min": "0.5",
+    "judge_score_min": "0.25",
     "judge_model_path": "",
     "history_max": "200",
 }
@@ -66,13 +66,26 @@ def save_settings(values: dict[str, str]):
 
 def settings_env_snippet(values: dict[str, str]) -> str:
     lines = [
-        f"export JUDGE_BACKEND={values.get('judge_backend', 'stub')}",
-        f"export JUDGE_SCORE_MIN={values.get('judge_score_min', '0.5')}",
+        f"export JUDGE_BACKEND={values.get('judge_backend', 'unsup')}",
+        f"export JUDGE_SCORE_MIN={values.get('judge_score_min', '0.25')}",
     ]
     model = values.get("judge_model_path", "").strip()
     if model:
         lines.append(f"export JUDGE_MODEL_PATH={model!r}")
     return "\n".join(lines)
+
+
+def apply_settings_to_env() -> dict[str, str]:
+    """실행기 시작 시 설정 파일을 환경 변수로 넣는다. 이미 있는 env 는 유지."""
+    if not SETTINGS_PATH.is_file():
+        save_settings(DEFAULT_SETTINGS)
+    values = load_settings()
+    os.environ.setdefault("JUDGE_BACKEND", values.get("judge_backend") or "stub")
+    os.environ.setdefault("JUDGE_SCORE_MIN", values.get("judge_score_min") or "0.25")
+    model = (values.get("judge_model_path") or "").strip()
+    if model:
+        os.environ.setdefault("JUDGE_MODEL_PATH", model)
+    return values
 
 
 def _history_max() -> int:
@@ -210,14 +223,17 @@ def _make_preview(archive: Path, judgment: dict[str, Any]) -> Path:
         return preview_path
 
     img = Image.open(src).convert("RGB")
-    draw = ImageDraw.Draw(img)
-    for idx, bbox in enumerate(bboxes):
-        if not bbox or len(bbox) < 4:
-            continue
-        x1, y1, x2, y2 = bbox[:4]
-        color = "#EF4444" if idx == 0 else "#F59E0B"
-        draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
+    orig_w, orig_h = img.size
     img.thumbnail(PREVIEW_SIZE)
+    if bboxes and orig_w > 0 and orig_h > 0:
+        sx, sy = img.size[0] / orig_w, img.size[1] / orig_h
+        draw = ImageDraw.Draw(img)
+        for idx, bbox in enumerate(bboxes):
+            if not bbox or len(bbox) < 4:
+                continue
+            x1, y1, x2, y2 = bbox[:4]
+            box = [x1 * sx, y1 * sy, x2 * sx, y2 * sy]
+            draw.rectangle(box, outline="#EF4444", width=3)
     img.save(preview_path, quality=85)
     return preview_path
 
@@ -528,24 +544,30 @@ _DEMO_SAMPLES = (
 )
 
 
-def _remove_demo_records():
+def remove_demo_records():
+    removed = 0
     for rec in list_records():
         if rec.get("backend") != _DEMO_MARKER:
             continue
         path = rec.get("archive_path")
         if path and Path(path).is_dir():
             shutil.rmtree(path, ignore_errors=True)
+            removed += 1
+    staging = RECORDS_ROOT / "_demo_staging"
+    if staging.is_dir():
+        shutil.rmtree(staging, ignore_errors=True)
+    return removed
 
 
 def seed_demo_records(force: bool = False) -> list[dict[str, Any]]:
-    """데모 6건 — OK 3 · NG 3 · 각 6면(1차4+2차2) 이미지."""
+    """데모 6건 — 개발용 CLI. 운영 UI는 쓰지 않는다."""
     from datetime import timedelta
 
     existing = [r for r in list_records() if r.get("backend") == _DEMO_MARKER]
     if not force and len(existing) >= len(_DEMO_SAMPLES):
         return existing
 
-    _remove_demo_records()
+    remove_demo_records()
     staging = RECORDS_ROOT / "_demo_staging"
     if staging.is_dir():
         shutil.rmtree(staging, ignore_errors=True)

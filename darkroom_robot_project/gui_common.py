@@ -5,6 +5,7 @@ import json
 import socket
 import threading
 import time
+from collections import Counter
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
@@ -24,7 +25,6 @@ from ui_store import (
     list_records,
     load_settings,
     save_settings,
-    seed_demo_records,
     settings_env_snippet,
 )
 
@@ -59,13 +59,104 @@ def face_label(inspect: str, face_id: int) -> str:
     return f"면 {face_id}"
 
 
+CLASS_LABELS = {
+    "unknown": "이상",
+    "scratch": "스크래치",
+    "contamination": "이물",
+    "dent": "찌그러짐",
+    "edge_break": "모서리 깨짐",
+    "dimension": "치수 불량",
+    "code_fail": "코드 인식 실패",
+    "mock_defect": "테스트 불량",
+}
+
+
+def class_label(class_name: str) -> str:
+    key = (class_name or "").strip().lower()
+    return CLASS_LABELS.get(key, class_name or "기타")
+
+
 def defect_line(item: dict) -> str:
     inspect = item.get("inspect", "")
     face_id = int(item.get("cam_id", 0))
+    name = class_label(str(item.get("class_name") or "unknown"))
+    score = float(item.get("score", 0) or 0)
+    threshold = float(item.get("threshold", 0) or 0)
+    ng = item.get("ng")
+    source = str(item.get("source") or "")
+    if source == "yolo" and name == "이상":
+        name = "YOLO"
+    if threshold > 0:
+        mark = "NG" if ng or (ng is None and score >= threshold) else "OK"
+        if 0 <= score <= 1.5 and 0 < threshold <= 1.5:
+            return (
+                f"  {face_label(inspect, face_id)}  {inspect}  "
+                f"{mark}  {name}  {score * 100:.0f}%"
+            )
+        return (
+            f"  {face_label(inspect, face_id)}  {inspect}  "
+            f"{mark}  {name}  {score:.1f}/{threshold:.1f}"
+        )
+    percent = score * 100 if score <= 1.5 else score
     return (
         f"  {face_label(inspect, face_id)}  {inspect}  "
-        f"{item.get('class_name')}  {float(item.get('score', 0)):.0f}%"
+        f"{name}  {percent:.0f}%"
     )
+
+
+LIVE_BACKENDS = ("unsup", "model", "both", "yolo", "unsup+yolo")
+YOLO_CLASSES = ("scratch", "dent")
+
+
+def split_judge_items(judgment: dict | None) -> tuple[list, list]:
+    """비지도 면 점수와 YOLO 검출을 나눈다."""
+    payload = judgment or {}
+    scores = list(payload.get("scores") or [])
+    defects = list(payload.get("defects") or [])
+    if scores:
+        unsup = [row for row in scores if row.get("source") == "unsup"]
+        yolo = [
+            row for row in scores
+            if row.get("source") == "yolo"
+            and str(row.get("class_name") or "").strip().lower() in YOLO_CLASSES
+        ]
+        if not unsup:
+            unsup = [row for row in scores if row.get("source") not in ("unsup", "yolo")]
+        return unsup, yolo
+    unsup, yolo = [], []
+    for item in defects:
+        key = str(item.get("class_name") or "unknown").strip().lower()
+        if key in YOLO_CLASSES:
+            yolo.append(item)
+        else:
+            unsup.append(item)
+    return unsup, yolo
+
+
+def yolo_category_summary(items: list) -> str:
+    counts = Counter()
+    for item in items:
+        key = str(item.get("class_name") or "").strip().lower()
+        if key in YOLO_CLASSES:
+            counts[key] += 1
+        elif item.get("ng"):
+            counts[key or "unknown"] += 1
+    if not counts:
+        return "검출 없음"
+    parts = []
+    for key in YOLO_CLASSES:
+        if counts.get(key):
+            parts.append(f"{CLASS_LABELS.get(key, key)} {counts[key]}건")
+    for key, n in counts.items():
+        if key not in YOLO_CLASSES:
+            parts.append(f"{class_label(key)} {n}건")
+    return " · ".join(parts)
+
+
+def _bbox_key(bbox):
+    if not bbox or len(bbox) < 4:
+        return None
+    return tuple(int(round(float(x))) for x in bbox[:4])
 
 PHASE_LABELS = {
     "PICK": "샘플 집는 중",
@@ -75,6 +166,7 @@ PHASE_LABELS = {
     "FLIP": "뒤집는 중",
     "INSPECT_2": "2차 검사중",
     "BRINGOUT": "판정중",
+    "JUDGE": "판정중",
     "SORT": "분류 중",
     "REPORT": "완료",
     "PING": "통신 확인",
@@ -253,18 +345,35 @@ def phase_label(command: str) -> str:
     return PHASE_LABELS.get(command, command)
 
 
-def render_image(path, bboxes=None, highlight_idx=-1, size=CELL_SIZE):
-    img = Image.open(path).convert("RGB")
-    if bboxes:
-        draw = ImageDraw.Draw(img)
-        for idx, bbox in enumerate(bboxes):
-            if not bbox or len(bbox) < 4:
-                continue
-            x1, y1, x2, y2 = bbox[:4]
-            color = "#EF4444" if idx == highlight_idx else "#F59E0B"
-            width = 4 if idx == highlight_idx else 2
-            draw.rectangle([x1, y1, x2, y2], outline=color, width=width)
+def _overlay_bboxes(img, bboxes, highlight_idx=-1, orig_size=None):
+    """화면 크기에 맞춘 뒤에 빨간 박스만 그린다."""
+    if not bboxes:
+        return
+    orig_w, orig_h = orig_size or img.size
+    w, h = img.size
+    if orig_w <= 0 or orig_h <= 0:
+        return
+    sx, sy = w / orig_w, h / orig_h
+    draw = ImageDraw.Draw(img)
+    for idx, bbox in enumerate(bboxes):
+        if not bbox or len(bbox) < 4:
+            continue
+        x1, y1, x2, y2 = bbox[:4]
+        box = [x1 * sx, y1 * sy, x2 * sx, y2 * sy]
+        width = 4 if idx == highlight_idx else 3
+        draw.rectangle(box, outline="#EF4444", width=width)
+
+
+def render_image(path, bboxes=None, highlight_idx=-1, size=CELL_SIZE, cam_id=None, inspect=None):
+    if cam_id is not None:
+        from camera_calib import inspect_stage, open_camera_rgb
+
+        img = open_camera_rgb(path, cam_id, stage=inspect_stage(inspect))
+    else:
+        img = Image.open(path).convert("RGB")
+    orig_size = img.size
     img.thumbnail(size)
+    _overlay_bboxes(img, bboxes, highlight_idx, orig_size=orig_size)
     return ImageTk.PhotoImage(img)
 
 
@@ -346,6 +455,7 @@ class PillButton(Frame):
         self._disabled_variant = disabled_variant
         self._command = command
         self._enabled = True
+        self._pressed = False
         self._photo = None
         self._hover_photo = None
         self._fg = COLORS["text_primary"]
@@ -356,13 +466,23 @@ class PillButton(Frame):
         self._lbl.pack()
         self._render()
         for w in (self, self._lbl):
-            w.bind("<Button-1>", self._on_click)
+            w.bind("<ButtonPress-1>", self._on_press)
+            w.bind("<ButtonRelease-1>", self._on_release)
             w.bind("<Enter>", self._on_enter)
             w.bind("<Leave>", self._on_leave)
 
-    def _on_click(self, _event=None):
+    def _invoke(self):
         if self._enabled and self._command:
             self._command()
+
+    def _on_press(self, _event=None):
+        self._pressed = True
+
+    def _on_release(self, _event=None):
+        if not getattr(self, "_pressed", False):
+            return
+        self._pressed = False
+        self._invoke()
 
     def _on_enter(self, _event=None):
         if self._enabled and self._hover_photo is not None:
@@ -589,27 +709,47 @@ class RecordDetailPanel(Frame):
         self.inspect_wall = InspectWall(self.wall_host, cell_size=(228, 128), auto_pack=False, show_header=False)
         self.inspect_wall.pack(fill="x")
 
-        _section_label(body, "불량 위치")
+        _section_label(body, "비지도")
         defect_block = Frame(body, bg=COLORS["bg_cell"], highlightthickness=0)
         defect_block.pack(fill="x", padx=4, pady=(0, 4))
         defect_head = Frame(defect_block, bg=COLORS["bg_cell"])
         defect_head.pack(fill="x", padx=10, pady=(8, 4))
-        self.defect_summary = StringVar(value="")
+        self.unsup_summary = StringVar(value="")
+        self.defect_summary = self.unsup_summary
         Label(
-            defect_head, textvariable=self.defect_summary, font=FONT_SMALL,
+            defect_head, textvariable=self.unsup_summary, font=FONT_SMALL,
             fg=COLORS["text_dim"], bg=COLORS["bg_cell"], anchor="w",
         ).pack(fill="x")
-        list_wrap = Frame(defect_block, bg=COLORS["bg_cell"])
-        list_wrap.pack(fill="x", padx=8, pady=(0, 8))
-        self.defect_list = Listbox(
-            list_wrap, font=FONT_BODY, height=6,
+        self.unsup_list = Listbox(
+            defect_block, font=FONT_BODY, height=6,
             bg=COLORS["bg_root"], fg=COLORS["text_primary"],
             selectbackground=COLORS["accent_soft"], selectforeground=COLORS["accent"],
             relief="flat", borderwidth=0, highlightthickness=0,
             activestyle="none",
         )
-        self.defect_list.pack(fill="x", padx=2, pady=2)
-        self.defect_list.bind("<<ListboxSelect>>", self._on_defect_select)
+        self.unsup_list.pack(fill="x", padx=10, pady=(0, 8))
+        self.unsup_list.bind("<<ListboxSelect>>", self._on_defect_select)
+        self.defect_list = self.unsup_list
+
+        _section_label(body, "YOLO")
+        yolo_block = Frame(body, bg=COLORS["bg_cell"], highlightthickness=0)
+        yolo_block.pack(fill="x", padx=4, pady=(0, 4))
+        yolo_head = Frame(yolo_block, bg=COLORS["bg_cell"])
+        yolo_head.pack(fill="x", padx=10, pady=(8, 4))
+        self.yolo_summary = StringVar(value="")
+        Label(
+            yolo_head, textvariable=self.yolo_summary, font=FONT_SMALL,
+            fg=COLORS["text_dim"], bg=COLORS["bg_cell"], anchor="w",
+        ).pack(fill="x")
+        self.yolo_list = Listbox(
+            yolo_block, font=FONT_BODY, height=5,
+            bg=COLORS["bg_root"], fg=COLORS["text_primary"],
+            selectbackground=COLORS["accent_soft"], selectforeground=COLORS["accent"],
+            relief="flat", borderwidth=0, highlightthickness=0,
+            activestyle="none",
+        )
+        self.yolo_list.pack(fill="x", padx=10, pady=(0, 8))
+        self.yolo_list.bind("<<ListboxSelect>>", self._on_defect_select)
 
         btn_row = Frame(body, bg=COLORS["bg_card"])
         btn_row.pack(fill="x", padx=4, pady=(16, 12))
@@ -640,8 +780,13 @@ class RecordDetailPanel(Frame):
         self.verdict_label.config(bg=COLORS["bg_cell"], fg=COLORS["text_dim"])
         self.verdict_sub_label.config(bg=COLORS["bg_cell"])
         self.preview_label.config(image="", text="미리보기", fg=COLORS["text_dim"])
-        self.defect_summary.set("")
-        self.defect_list.delete(0, END)
+        self.unsup_summary.set("")
+        self.yolo_summary.set("")
+        self.unsup_list.delete(0, END)
+        self.yolo_list.delete(0, END)
+        self._unsup_items = []
+        self._yolo_items = []
+        self._list_items = []
         self.load_btn.set_enabled(False)
         self.inspect_wall.clear()
 
@@ -663,13 +808,20 @@ class RecordDetailPanel(Frame):
         if record.get("message"):
             self.meta_var.set(self.meta_var.get() + f"\n{record['message']}")
 
+        unsup_items, yolo_items = split_judge_items(judgment)
         self.verdict_var.set(verdict)
         if verdict == "OK":
             bg, fg, edge = COLORS["ok_bg"], COLORS["ok"], COLORS["ok"]
-            self.verdict_sub.set("불량 없음")
+            self.verdict_sub.set("비지도 · YOLO 통과" if yolo_items or unsup_items else "불량 없음")
         elif verdict == "NG":
             bg, fg, edge = COLORS["ng_bg"], COLORS["ng"], COLORS["ng"]
-            self.verdict_sub.set(f"불량 {len(defects)}건")
+            parts = []
+            unsup_ng = sum(1 for item in unsup_items if item.get("ng"))
+            if unsup_items:
+                parts.append(f"비지도 {unsup_ng}면")
+            if yolo_items:
+                parts.append(f"YOLO {yolo_category_summary(yolo_items)}")
+            self.verdict_sub.set(" · ".join(parts) or f"불량 {len(defects)}건")
         else:
             bg, fg, edge = COLORS["bg_cell"], COLORS["text_dim"], COLORS["border_soft"]
             self.verdict_sub.set("")
@@ -700,18 +852,41 @@ class RecordDetailPanel(Frame):
         self.inspect_wall.load_capture_folders(captures)
         self.inspect_wall.set_judgment(judgment)
 
-        self.defect_list.delete(0, END)
-        if not defects:
-            self.defect_summary.set("불량 없음")
+        unsup_items, yolo_items = split_judge_items(judgment)
+        self._unsup_items = unsup_items
+        self._yolo_items = yolo_items
+        self._list_items = unsup_items + yolo_items
+        self.unsup_list.delete(0, END)
+        self.yolo_list.delete(0, END)
+        if unsup_items:
+            ng_n = sum(1 for item in unsup_items if item.get("ng"))
+            self.unsup_summary.set(f"{len(unsup_items)}면 · 이상 {ng_n}면 · 선택 시 위치 강조")
+            for item in unsup_items:
+                self.unsup_list.insert(END, defect_line(item))
         else:
-            self.defect_summary.set(f"{len(defects)}건 · 선택 시 위치 강조")
-            for item in defects:
-                self.defect_list.insert(END, defect_line(item))
+            self.unsup_summary.set("이번 판정 없음")
+        if yolo_items:
+            self.yolo_summary.set(yolo_category_summary(yolo_items) + " · 선택 시 위치 강조")
+            for item in yolo_items:
+                self.yolo_list.insert(END, defect_line(item))
+        else:
+            self.yolo_summary.set("검출 없음  ·  스크래치 0 · 찌그러짐 0")
         self.load_btn.set_enabled(True)
 
-    def _on_defect_select(self, _event=None):
-        sel = self.defect_list.curselection()
-        if sel:
+    def _on_defect_select(self, event=None):
+        widget = event.widget if event is not None else self.unsup_list
+        sel = widget.curselection()
+        if not sel:
+            return
+        if widget is self.yolo_list:
+            items = getattr(self, "_yolo_items", None)
+            self.unsup_list.selection_clear(0, END)
+        else:
+            items = getattr(self, "_unsup_items", None) or getattr(self, "_list_items", None)
+            self.yolo_list.selection_clear(0, END)
+        if items and 0 <= int(sel[0]) < len(items):
+            self.inspect_wall.highlight_item(items[int(sel[0])])
+        else:
             self.inspect_wall.highlight_defect(int(sel[0]))
 
 
@@ -772,7 +947,6 @@ class RecordsPage(Frame):
         )
         self._filter_wrap.pack(side="left")
         PillButton(btn_row, "↩ 검사 화면", self._go_back, variant="secondary").pack(side="left", padx=(12, 0))
-        PillButton(btn_row, "데모 6건", self._seed_demo, variant="ghost").pack(side="left", padx=(8, 0))
         PillButton(btn_row, "새로고침", self.refresh, variant="secondary").pack(side="left", padx=(8, 0))
         PillButton(btn_row, "기록 전체 삭제", self._clear, variant="danger").pack(side="right")
 
@@ -870,7 +1044,7 @@ class RecordsPage(Frame):
 
         if not self._filtered:
             msg = "해당 조건의 샘플이 없습니다." if self._records else (
-                "아직 저장된 샘플이 없습니다.\n「데모 6건」으로 미리보기를 만들 수 있습니다."
+                "아직 저장된 샘플이 없습니다.\n연속 검사가 끝나면 여기에 쌓입니다."
             )
             Label(
                 self.grid_inner, text=msg,
@@ -991,11 +1165,6 @@ class RecordsPage(Frame):
             self.grid_canvas.update_idletasks()
             y = frame.winfo_y()
             self.grid_canvas.yview_moveto(max(0, (y - 20) / max(1, self.grid_inner.winfo_height())))
-
-    def _seed_demo(self):
-        seed_demo_records(force=True)
-        self._selected_id = None
-        self.refresh()
 
     def _clear(self):
         import tkinter.messagebox as mb
@@ -1141,7 +1310,7 @@ class ReportsPage(Frame):
         self._photos[key] = photo
         label.config(image=photo)
 
-    def refresh(self):
+    def refresh(self, scroll=True):
         from reports_analytics import build_report_bundle
 
         bundle = build_report_bundle(self._period)
@@ -1161,7 +1330,13 @@ class ReportsPage(Frame):
         self._render_ng_log(bundle["ng_log"])
         if bundle["ng_log"]:
             self._select_ng(0, bundle["ng_log"][0])
-        self._scroll.scroll_to_top()
+        elif hasattr(self, "_detail_title"):
+            self._detail_title.set("NG 상세")
+            self._detail_meta.set("NG 기록이 없습니다")
+            self._detail_preview.config(image="", text="—")
+            self._selected_ng = None
+        if scroll:
+            self._scroll.scroll_to_top()
 
     def _render_ng_log(self, items: list[dict]):
         for child in self._ng_host.winfo_children():
@@ -1274,7 +1449,7 @@ class ReportsPage(Frame):
 class SettingsPage(Frame):
     """시스템 설정 — 판정·장치·경로."""
 
-    BACKENDS = ("stub", "mock", "model")
+    BACKENDS = ("unsup", "yolo", "both", "stub", "mock", "model")
 
     def __init__(self, parent, on_back=None):
         super().__init__(parent, bg=COLORS["bg_root"])
@@ -1296,9 +1471,9 @@ class SettingsPage(Frame):
         judge_card = Card(scroll_wrap, padx=14, pady=14)
         judge_card.pack(fill="x", pady=(0, 8))
         Label(judge_card, text="판정 (AI)", font=FONT_HEAD, fg=COLORS["text_primary"], bg=COLORS["bg_card"]).pack(anchor="w")
-        self._add_field(judge_card, "judge_backend", "백엔드", hint="stub · mock · model")
-        self._add_field(judge_card, "judge_score_min", "NG 임계값 (0~1)", hint="confidence ≥ 값이면 NG")
-        self._add_field(judge_card, "judge_model_path", "모델 경로", hint="model 백엔드용 가중치 파일")
+        self._add_field(judge_card, "judge_backend", "백엔드", hint="unsup(비지도+YOLO) · yolo · both · stub · mock")
+        self._add_field(judge_card, "judge_score_min", "YOLO NG 임계값", hint="confidence 0~1. 비지도는 면별 학습 문턱")
+        self._add_field(judge_card, "judge_model_path", "YOLO 모델 경로", hint="비우면 crop640/weights/best.pt")
         self._add_field(judge_card, "history_max", "기록 보관 한도", hint="검사 기록 최대 건수")
 
         hw_card = Card(scroll_wrap, padx=14, pady=14)
@@ -1313,6 +1488,11 @@ class SettingsPage(Frame):
         path_card = Card(scroll_wrap, padx=14, pady=14)
         path_card.pack(fill="x", pady=(0, 8))
         Label(path_card, text="경로 · 포트", font=FONT_HEAD, fg=COLORS["text_primary"], bg=COLORS["bg_card"]).pack(anchor="w")
+        Label(
+            path_card,
+            text="샘플 면은 Geti OpenVINO. 크롭 확인: python crop_ui.py  ·  화각: python fov_ui.py  (화각 창은 운영 UI와 동시에 켜지 말 것)",
+            font=FONT_SMALL, fg=COLORS["text_dim"], bg=COLORS["bg_card"],
+        ).pack(anchor="w", pady=(6, 0))
         self.path_var = __import__("tkinter").StringVar(value="")
         Label(
             path_card, textvariable=self.path_var, font=FONT_BODY,
@@ -1392,14 +1572,14 @@ class SettingsPage(Frame):
     def save(self):
         values = {k: v.get().strip() for k, v in self._fields.items()}
         if values.get("judge_backend") not in self.BACKENDS:
-            self.status_var.set("백엔드는 stub, mock, model 중 하나여야 합니다.")
+            self.status_var.set("백엔드는 unsup, yolo, both, stub, mock, model 중 하나여야 합니다.")
             return
         try:
             score = float(values.get("judge_score_min", "0.5"))
             if not 0 <= score <= 1:
                 raise ValueError
         except ValueError:
-            self.status_var.set("NG 임계값은 0~1 사이 숫자여야 합니다.")
+            self.status_var.set("YOLO NG 임계값은 0~1 사이 숫자여야 합니다.")
             return
         try:
             int(values.get("history_max", "200"))
@@ -1489,15 +1669,16 @@ class TimelineStrip(Frame):
 
 
 class OperatorPanel(Card):
-    """Vision Mate 스타일 — 판정 · 통계 · 실행/중지."""
+    """Vision Mate 스타일 — 판정 · 통계 · 시작/중지/비상정지."""
 
-    def __init__(self, parent, on_run, on_stop):
+    def __init__(self, parent, on_run, on_stop, on_estop=None):
         super().__init__(parent, padx=14, pady=14)
         self.pack(side="right", fill="y", padx=(0, 12), pady=12)
         self.configure(width=300)
         self.pack_propagate(False)
         self.on_run = on_run
         self.on_stop = on_stop
+        self.on_estop = on_estop or on_stop
 
         Label(self, text="검사 결과", font=FONT_HEAD, fg=COLORS["text_primary"], bg=COLORS["bg_card"]).pack(anchor="w")
 
@@ -1530,42 +1711,60 @@ class OperatorPanel(Card):
         btn_row.pack(fill="x", pady=(0, 12))
         action_w = 272
         self.run_btn = PillButton(
-            btn_row, "▶  연속 검사", self.on_run, variant="primary",
+            btn_row, "▶  검사 시작", self.on_run, variant="primary",
             font=FONT_HEAD, width=action_w, pady=14,
             surface=COLORS["bg_card"],
         )
         self.run_btn.pack(pady=(0, 8))
         self.stop_btn = PillButton(
-            btn_row, "■  검사 정지", self.on_stop, variant="stop_on",
-            disabled_variant="stop_off", font=FONT_HEAD, width=action_w, pady=14,
+            btn_row, "■  검사 중지", self.on_stop, variant="stop_on",
+            font=FONT_HEAD, width=action_w, pady=14,
             surface=COLORS["bg_card"],
         )
-        self.stop_btn.set_enabled(False)
-        self.stop_btn.pack()
+        self.stop_btn.pack(pady=(0, 8))
+        self.estop_btn = PillButton(
+            btn_row, "비상정지", self.on_estop, variant="secondary",
+            font=FONT_HEAD, width=action_w, pady=14,
+            surface=COLORS["bg_card"],
+        )
+        self.estop_btn.pack()
 
-        Label(self, text="불량 위치", font=FONT_HEAD, fg=COLORS["text_primary"], bg=COLORS["bg_card"]).pack(anchor="w", pady=(4, 4))
-        self.defect_summary = __import__("tkinter").StringVar(value="판정 후 표시")
-        Label(self, textvariable=self.defect_summary, font=FONT_SMALL, fg=COLORS["text_dim"], bg=COLORS["bg_card"], wraplength=260, justify="left").pack(anchor="w")
+        Label(self, text="비지도", font=FONT_HEAD, fg=COLORS["text_primary"], bg=COLORS["bg_card"]).pack(anchor="w", pady=(8, 2))
+        self.unsup_summary = __import__("tkinter").StringVar(value="판정 후 표시")
+        Label(self, textvariable=self.unsup_summary, font=FONT_SMALL, fg=COLORS["text_dim"], bg=COLORS["bg_card"], wraplength=260, justify="left").pack(anchor="w")
+        self.unsup_list = self._score_listbox(self, pady=(4, 8))
 
-        list_wrap = Frame(self, bg=COLORS["bg_cell"], highlightthickness=0)
-        list_wrap.pack(fill="both", expand=True, pady=(6, 0))
-        self.listbox = Listbox(
-            list_wrap, font=FONT_BODY,
+        Label(self, text="YOLO", font=FONT_HEAD, fg=COLORS["text_primary"], bg=COLORS["bg_card"]).pack(anchor="w", pady=(0, 2))
+        self.yolo_summary = __import__("tkinter").StringVar(value="스크래치 · 찌그러짐")
+        Label(self, textvariable=self.yolo_summary, font=FONT_SMALL, fg=COLORS["text_dim"], bg=COLORS["bg_card"], wraplength=260, justify="left").pack(anchor="w")
+        self.yolo_list = self._score_listbox(self, pady=(4, 0))
+
+        self.inspect_wall = None
+        self.list_items = []
+        self.unsup_items = []
+        self.yolo_items = []
+        self.listbox = self.unsup_list
+        self.defect_summary = self.unsup_summary
+
+    def _score_listbox(self, parent, pady=(4, 0)):
+        wrap = Frame(parent, bg=COLORS["bg_cell"], highlightthickness=0)
+        wrap.pack(fill="both", expand=True, pady=pady)
+        box = Listbox(
+            wrap, font=FONT_BODY, height=5,
             bg=COLORS["bg_root"], fg=COLORS["text_primary"],
             selectbackground=COLORS["accent_soft"], selectforeground=COLORS["accent"],
             relief="flat", borderwidth=0, highlightthickness=0, activestyle="none",
         )
         scroll = ttk.Scrollbar(
-            list_wrap, orient="vertical", command=self.listbox.yview, style="Dark.Vertical.TScrollbar",
+            wrap, orient="vertical", command=box.yview, style="Dark.Vertical.TScrollbar",
         )
-        self.listbox.pack(side="left", fill="both", expand=True, padx=6, pady=6)
+        box.pack(side="left", fill="both", expand=True, padx=6, pady=6)
         scroll.pack(side="right", fill="y", padx=(0, 4), pady=4)
-        self.listbox.config(yscrollcommand=scroll.set)
-        self.inspect_wall = None
+        box.config(yscrollcommand=scroll.set)
+        return box
 
     def set_controls(self, idle=True):
         self.run_btn.set_enabled(idle)
-        self.stop_btn.set_enabled(not idle)
 
     def set_stats(self, total, ok):
         rate = f"{ok / total * 100:.1f}%" if total else "—"
@@ -1581,14 +1780,25 @@ class OperatorPanel(Card):
 
     def set_verdict(self, verdict, judgment=None):
         judgment = judgment or {}
-        defects = judgment.get("defects") or []
+        unsup_items, yolo_items = split_judge_items(judgment)
+        unsup_ng = sum(1 for item in unsup_items if item.get("ng"))
         self.verdict_var.set(verdict)
         if verdict == "OK":
             bg, fg = COLORS["ok_bg"], COLORS["ok"]
-            self.verdict_sub.set("불량 없음")
+            if judgment.get("backend") in LIVE_BACKENDS:
+                self.verdict_sub.set("비지도 · YOLO 통과")
+            else:
+                self.verdict_sub.set("불량 없음")
         elif verdict == "NG":
             bg, fg = COLORS["ng_bg"], COLORS["ng"]
-            self.verdict_sub.set(f"불량 {len(defects)}건")
+            parts = []
+            if unsup_items:
+                parts.append(f"비지도 {unsup_ng}면")
+            if yolo_items:
+                parts.append(f"YOLO {yolo_category_summary(yolo_items)}")
+            elif judgment.get("backend") in LIVE_BACKENDS:
+                parts.append("YOLO 검출 없음")
+            self.verdict_sub.set(" · ".join(parts) or f"불량 {len(judgment.get('defects') or [])}건")
         else:
             bg, fg = COLORS["bg_cell"], COLORS["text_dim"]
             self.verdict_sub.set("")
@@ -1596,27 +1806,52 @@ class OperatorPanel(Card):
         self.verdict_label.config(bg=bg, fg=fg)
 
     def clear_defects(self):
-        self.listbox.delete(0, END)
-        self.defect_summary.set("판정 후 표시")
+        self.unsup_list.delete(0, END)
+        self.yolo_list.delete(0, END)
+        self.list_items = []
+        self.unsup_items = []
+        self.yolo_items = []
+        self.unsup_summary.set("판정 후 표시")
+        self.yolo_summary.set("스크래치 · 찌그러짐")
         if self.inspect_wall:
             self.inspect_wall.highlight_defect(-1)
 
     def set_judgment(self, judgment, inspect_wall=None):
         if inspect_wall is not None:
             self.inspect_wall = inspect_wall
-        defects = list((judgment or {}).get("defects") or [])
-        self.listbox.delete(0, END)
-        if not defects:
-            self.defect_summary.set("불량 없음")
-            if self.inspect_wall:
-                self.inspect_wall.highlight_defect(-1)
-            return
-        self.defect_summary.set(f"{len(defects)}건 · 선택 시 위치 강조")
-        for item in defects:
-            self.listbox.insert(END, defect_line(item))
+        unsup_items, yolo_items = split_judge_items(judgment)
+        self.unsup_items = unsup_items
+        self.yolo_items = yolo_items
+        self.list_items = unsup_items + yolo_items
+        self.unsup_list.delete(0, END)
+        self.yolo_list.delete(0, END)
+        if unsup_items:
+            ng_n = sum(1 for item in unsup_items if item.get("ng"))
+            self.unsup_summary.set(f"{len(unsup_items)}면 · 이상 {ng_n}면 · 선택 시 위치 강조")
+            for item in unsup_items:
+                self.unsup_list.insert(END, defect_line(item))
+        else:
+            self.unsup_summary.set("이번 판정 없음")
+        if yolo_items:
+            self.yolo_summary.set(yolo_category_summary(yolo_items) + " · 선택 시 위치 강조")
+            for item in yolo_items:
+                self.yolo_list.insert(END, defect_line(item))
+        else:
+            self.yolo_summary.set("검출 없음  ·  스크래치 0 · 찌그러짐 0")
+        if not unsup_items and not yolo_items and self.inspect_wall:
+            self.inspect_wall.highlight_defect(-1)
 
     def bind_defect_select(self, callback):
-        self.listbox.bind("<<ListboxSelect>>", callback)
+        def on_unsup(event):
+            self.yolo_list.selection_clear(0, END)
+            callback(event)
+
+        def on_yolo(event):
+            self.unsup_list.selection_clear(0, END)
+            callback(event)
+
+        self.unsup_list.bind("<<ListboxSelect>>", on_unsup)
+        self.yolo_list.bind("<<ListboxSelect>>", on_yolo)
 
 
 class VerdictBar(Card):
@@ -1663,36 +1898,53 @@ class InspectWall(Frame):
             Label(outer, text="검사 영상", font=FONT_HEAD, fg=COLORS["text_primary"], bg=COLORS["bg_card"]).pack(anchor="w")
             self.subtitle = Label(
                 outer,
-                text=f"총 {INSPECT_FACE_TOTAL}면",
+                text="1차 4면 · 2차 2면 (임시 분리)",
                 font=FONT_SMALL, fg=COLORS["text_dim"], bg=COLORS["bg_card"],
             )
             self.subtitle.pack(anchor="w", pady=(0, 8))
         else:
             self.subtitle = None
 
-        grid = Frame(outer, bg=COLORS["bg_card"])
-        grid.pack(fill="both", expand=True)
-        rows = (len(INSPECT_GRID) + INSPECT_GRID_COLS - 1) // INSPECT_GRID_COLS
-        for col in range(INSPECT_GRID_COLS):
-            grid.columnconfigure(col, weight=1)
-        for row in range(rows):
-            grid.rowconfigure(row, weight=1)
+        sections = Frame(outer, bg=COLORS["bg_card"])
+        sections.pack(fill="both", expand=True)
+        section_meta = (
+            ("1차", "1차 검사", "카메라 1~4"),
+            ("2차", "2차 검사", "카메라 3·4 · 서보 180°"),
+        )
+        for inspect, title, hint in section_meta:
+            block = Frame(sections, bg=COLORS["bg_card"])
+            block.pack(fill="both", expand=True, pady=(0, 8))
+            head = Frame(block, bg=COLORS["bg_card"])
+            head.pack(fill="x", pady=(0, 4))
+            Label(head, text=title, font=FONT_HEAD, fg=COLORS["text_primary"], bg=COLORS["bg_card"]).pack(side="left")
+            Label(head, text=hint, font=FONT_SMALL, fg=COLORS["text_dim"], bg=COLORS["bg_card"]).pack(side="left", padx=(10, 0))
+            grid = Frame(block, bg=COLORS["bg_card"])
+            grid.pack(fill="both", expand=True)
+            faces = INSPECT_FACES[inspect]
+            cols = max(len(faces), 1)
+            for col in range(cols):
+                grid.columnconfigure(col, weight=1)
+            grid.rowconfigure(0, weight=1)
+            for col, face in enumerate(faces):
+                face_id = int(face["id"])
+                wrap = Frame(grid, bg=COLORS["bg_cell"], highlightthickness=0)
+                wrap.grid(row=0, column=col, padx=5, pady=5, sticky="nsew")
+                Label(
+                    wrap, text=face["name"], font=FONT_SMALL,
+                    fg=COLORS["text_dim"], bg=COLORS["bg_cell"],
+                ).pack(anchor="w", padx=8, pady=(6, 0))
+                cell = Label(wrap, text="—", bg=COLORS["bg_cell"], fg=COLORS["text_dim"], relief="flat")
+                cell.pack(fill="both", expand=True, padx=4, pady=4)
+                self.cells[(inspect, face_id)] = cell
 
-        for idx, face in enumerate(INSPECT_GRID):
-            row, col = divmod(idx, INSPECT_GRID_COLS)
-            inspect = face["inspect"]
-            face_id = int(face["id"])
-            wrap = Frame(grid, bg=COLORS["bg_cell"], highlightthickness=0)
-            wrap.grid(row=row, column=col, padx=5, pady=5, sticky="nsew")
-            Label(
-                wrap, text=face["name"], font=FONT_SMALL,
-                fg=COLORS["text_dim"], bg=COLORS["bg_cell"],
-            ).pack(anchor="w", padx=8, pady=(6, 0))
-            cell = Label(wrap, text="—", bg=COLORS["bg_cell"], fg=COLORS["text_dim"], relief="flat")
-            cell.pack(fill="both", expand=True, padx=4, pady=4)
-            self.cells[(inspect, face_id)] = cell
-
-    def clear(self):
+    def clear(self, inspect=None):
+        if inspect:
+            self.manifests.pop(inspect, None)
+            for key, cell in self.cells.items():
+                if key[0] == inspect:
+                    cell.config(image="", text="—")
+                    self.photos.pop(key, None)
+            return
         self.manifests.clear()
         self.judgment = {}
         for cell in self.cells.values():
@@ -1736,7 +1988,9 @@ class InspectWall(Frame):
             key = (inspect, cam_id)
             if path and Path(path).is_file():
                 try:
-                    photo = render_image(path, bboxes, highlight_idx, self.cell_size)
+                    photo = render_image(
+                        path, bboxes, highlight_idx, self.cell_size, cam_id=cam_id, inspect=inspect,
+                    )
                     self.photos[key] = photo
                     cell.config(image=photo, text="", compound="center")
                 except OSError:
@@ -1749,13 +2003,33 @@ class InspectWall(Frame):
         if defect_index < 0 or defect_index >= len(defects):
             self._refresh_all_cells()
             return
-        item = defects[defect_index]
+        self.highlight_item(defects[defect_index])
+
+    def highlight_item(self, item):
+        if not item:
+            self._refresh_all_cells()
+            return
         cam_id = int(item.get("cam_id", 0))
         inspect = item.get("inspect", "")
-        local_idx = sum(
-            1 for idx, d in enumerate(defects)
-            if idx < defect_index and d.get("inspect") == inspect and int(d.get("cam_id", 0)) == cam_id
-        )
+        target = _bbox_key(item.get("bbox"))
+        defects = self.judgment.get("defects") or []
+        local_idx = -1
+        fallback = -1
+        count = 0
+        for defect in defects:
+            if defect.get("inspect") != inspect or int(defect.get("cam_id", 0)) != cam_id:
+                continue
+            if fallback < 0:
+                fallback = count
+            if target and _bbox_key(defect.get("bbox")) == target:
+                local_idx = count
+                break
+            count += 1
+        if local_idx < 0:
+            local_idx = fallback
+        if local_idx < 0:
+            self._refresh_all_cells()
+            return
         self._refresh_all_cells(highlight=(inspect, cam_id, local_idx))
 
 

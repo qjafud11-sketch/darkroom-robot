@@ -1,12 +1,11 @@
 """판정 — 1·2차 manifest → verdict + defects.
 
-AI 모델은 나중에 `_infer_model()` 안에만 연결하면 된다.
 파이프라인·UI는 이 모듈의 결과 형식(JSON)만 보면 된다.
 
 환경 변수:
-  JUDGE_BACKEND   stub(기본) | mock | model
-  JUDGE_MODEL_PATH   model 백엔드용 가중치 경로 (미구현)
-  JUDGE_SCORE_MIN    NG로 볼 최소 confidence (기본 0.5)
+  JUDGE_BACKEND   unsup(기본, 비지도+YOLO) | yolo | both | stub | mock | model
+  JUDGE_MODEL_PATH   YOLO 가중치. 비우면 ~/darkroom_models/yolo/crop640/weights/best.pt
+  JUDGE_SCORE_MIN    YOLO NG confidence (기본 0.25). 비지도는 면별 threshold.json
   JUDGE_MOCK_NG      mock 백엔드에서 1이면 테스트 NG
 """
 from __future__ import annotations
@@ -30,6 +29,7 @@ class Defect:
     class_name: str
     score: float
     bbox: list[int]  # [x1, y1, x2, y2] — 1280×720 기준
+    threshold: float = 0.0
 
     def to_dict(self):
         return asdict(self)
@@ -39,9 +39,10 @@ class Defect:
 class JudgmentResult:
     verdict: str  # OK | NG
     defects: list[Defect] = field(default_factory=list)
+    scores: list[dict[str, Any]] = field(default_factory=list)
     manifest_1: str = ""
     manifest_2: str = ""
-    backend: str = "stub"
+    backend: str = "unsup"
     message: str = ""
     judged_at: str = ""
 
@@ -70,38 +71,48 @@ def load_manifest(folder: str) -> dict[str, Any] | None:
     return None
 
 
-def image_path_from_cam(cam: dict[str, Any] | None) -> str:
-    """판정·UI는 보정본이 있으면 그걸 쓴다. 원본만 있으면 원본."""
+def image_path_from_cam(cam: dict[str, Any] | None, prefer_ai: bool = True) -> str:
+    """UI는 보정본을 보여 준다. 비지도 채점은 학습과 같은 원본을 쓴다."""
     if not cam:
         return ""
-    for key in ("ai_file", "file"):
+    keys = ("ai_file", "file") if prefer_ai else ("file", "ai_file")
+    for key in keys:
         path = cam.get(key)
         if path and Path(path).is_file():
             return str(path)
     return ""
 
 
-def iter_images(manifest: dict[str, Any] | None, inspect_label: str):
+def iter_images(manifest: dict[str, Any] | None, inspect_label: str, prefer_ai: bool = True):
     """manifest에서 (cam_id, inspect, file_path) 순회."""
     if not manifest:
         return
     for cam in manifest.get("cameras") or []:
-        path = image_path_from_cam(cam)
+        path = image_path_from_cam(cam, prefer_ai=prefer_ai)
         if not path:
             continue
         yield int(cam["id"]), inspect_label, path
 
 
 def _score_min() -> float:
-    raw = os.environ.get("JUDGE_SCORE_MIN", "0.5")
+    raw = os.environ.get("JUDGE_SCORE_MIN", "0.25")
     try:
         return float(raw)
     except ValueError:
-        return 0.5
+        return 0.25
 
 
 def _backend_name() -> str:
-    return os.environ.get("JUDGE_BACKEND", "stub").strip().lower() or "stub"
+    env = os.environ.get("JUDGE_BACKEND", "").strip().lower()
+    if env:
+        return env
+    try:
+        from ui_store import load_settings
+
+        name = (load_settings().get("judge_backend") or "unsup").strip().lower()
+        return name or "unsup"
+    except Exception:
+        return "unsup"
 
 
 def _verdict_from_defects(defects: list[Defect]) -> str:
@@ -162,21 +173,238 @@ def _infer_mock(manifest_1: dict[str, Any], manifest_2: dict[str, Any]) -> Judgm
     )
 
 
-def _infer_model(manifest_1: dict[str, Any], manifest_2: dict[str, Any]) -> JudgmentResult:
-    """YOLO / OpenVINO 등 — 모델 파일 준비 후 여기에 추론 코드를 넣는다."""
-    model_path = os.environ.get("JUDGE_MODEL_PATH", "").strip()
-    if not model_path:
-        raise FileNotFoundError(
-            "JUDGE_MODEL_PATH 가 없습니다. stub/mock 으로 테스트하거나 모델 경로를 설정하세요."
-        )
-    if not Path(model_path).is_file():
-        raise FileNotFoundError(f"모델 파일 없음: {model_path}")
+def _live_modes(backend: str) -> tuple[bool, bool]:
+    """(비지도, YOLO) 실행 여부. unsup/model 은 둘 다 돌린다."""
+    name = (backend or "unsup").strip().lower()
+    if name == "yolo":
+        return False, True
+    if name in ("unsup", "model", "both"):
+        return True, True
+    return False, False
 
-    # TODO: for cam_id, inspect, path in chain(iter_images(m1,'1차'), iter_images(m2,'2차')):
-    #           detections = run_model(model_path, path)
-    #           defects.extend(...)
-    raise NotImplementedError(
-        f"model 백엔드 골격만 준비됨 — {model_path} 에 대한 추론 코드를 judgment._infer_model()에 추가"
+
+def _score_row(
+    cam_id: int,
+    inspect: str,
+    class_name: str,
+    path: str,
+    score: float,
+    threshold: float,
+    ng: bool,
+    bbox: list[int],
+    face: str = "",
+    source: str = "",
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    row = {
+        "cam_id": cam_id,
+        "inspect": inspect,
+        "class_name": class_name,
+        "face": face,
+        "path": path,
+        "score": score,
+        "threshold": threshold,
+        "ng": ng,
+        "bbox": list(bbox),
+        "source": source,
+    }
+    if extra:
+        row.update(extra)
+    return row
+
+
+def _infer_unsup(manifest_1: dict[str, Any], manifest_2: dict[str, Any]):
+    from unsup_infer import face_key_for, score_image
+
+    defects: list[Defect] = []
+    scores: list[dict[str, Any]] = []
+    missing: list[str] = []
+    errors: list[str] = []
+    tried = 0
+    for inspect, manifest in (("1차", manifest_1), ("2차", manifest_2)):
+        for cam_id, label, path in iter_images(manifest, inspect, prefer_ai=False):
+            key = face_key_for(label, cam_id)
+            if not key:
+                continue
+            tried += 1
+            try:
+                hit = score_image(path, key)
+            except FileNotFoundError:
+                missing.append(key)
+                continue
+            except Exception as exc:
+                errors.append(f"{key}: {exc}")
+                continue
+            scores.append(
+                _score_row(
+                    cam_id,
+                    label,
+                    "unknown",
+                    path,
+                    float(hit["score"]),
+                    float(hit["threshold"]),
+                    bool(hit["ng"]),
+                    list(hit["bbox"]),
+                    face=key,
+                    source="unsup",
+                    extra={"ratio": float(hit.get("ratio") or 0.0)},
+                )
+            )
+            if hit["ng"]:
+                defects.append(
+                    Defect(
+                        cam_id=cam_id,
+                        inspect=label,
+                        class_name="unknown",
+                        score=float(hit["score"]),
+                        bbox=list(hit["bbox"]),
+                        threshold=float(hit["threshold"]),
+                    )
+                )
+    return defects, scores, missing, errors, tried
+
+
+def _infer_yolo(manifest_1: dict[str, Any], manifest_2: dict[str, Any], fill_ok: bool):
+    from unsup_infer import face_key_for
+    from yolo_infer import detect_image, weights_path
+
+    if not weights_path().is_file():
+        return [], [], True, [], 0
+
+    conf = _score_min()
+    defects: list[Defect] = []
+    scores: list[dict[str, Any]] = []
+    errors: list[str] = []
+    tried = 0
+    for inspect, manifest in (("1차", manifest_1), ("2차", manifest_2)):
+        for cam_id, label, path in iter_images(manifest, inspect, prefer_ai=False):
+            key = face_key_for(label, cam_id)
+            if not key:
+                continue
+            tried += 1
+            try:
+                hits = detect_image(path, cam_id, conf=conf, inspect=label)
+            except Exception as exc:
+                errors.append(f"{key}: {exc}")
+                continue
+            if fill_ok and not hits:
+                scores.append(
+                    _score_row(
+                        cam_id,
+                        label,
+                        "unknown",
+                        path,
+                        0.0,
+                        conf,
+                        False,
+                        [0, 0, 0, 0],
+                        face=key,
+                        source="yolo",
+                    )
+                )
+            for hit in hits:
+                class_name = str(hit.get("class_name") or "unknown")
+                scores.append(
+                    _score_row(
+                        cam_id,
+                        label,
+                        class_name,
+                        path,
+                        float(hit["score"]),
+                        conf,
+                        True,
+                        list(hit["bbox"]),
+                        face=key,
+                        source="yolo",
+                    )
+                )
+                defects.append(
+                    Defect(
+                        cam_id=cam_id,
+                        inspect=label,
+                        class_name=class_name,
+                        score=float(hit["score"]),
+                        bbox=list(hit["bbox"]),
+                        threshold=conf,
+                    )
+                )
+    return defects, scores, False, errors, tried
+
+
+def _infer_model(manifest_1: dict[str, Any], manifest_2: dict[str, Any]) -> JudgmentResult:
+    """면별 PatchCore + YOLO. 한쪽이라도 NG 이면 불량."""
+    backend = _backend_name()
+    run_unsup, run_yolo = _live_modes(backend)
+    defects: list[Defect] = []
+    scores: list[dict[str, Any]] = []
+    parts: list[str] = []
+    missing: list[str] = []
+    errors: list[str] = []
+    tried = 0
+
+    if run_unsup:
+        u_defects, u_scores, missing, u_errors, u_tried = _infer_unsup(manifest_1, manifest_2)
+        defects.extend(u_defects)
+        scores.extend(u_scores)
+        errors.extend(u_errors)
+        tried += u_tried
+        unsup_faces = len(u_scores)
+        parts.append(f"비지도 PatchCore · {unsup_faces}면")
+        if u_defects:
+            parts.append(f"이상 {len(u_defects)}면")
+
+    if run_yolo:
+        y_defects, y_scores, y_missing, y_errors, y_tried = _infer_yolo(
+            manifest_1, manifest_2, fill_ok=not run_unsup
+        )
+        defects.extend(y_defects)
+        scores.extend(y_scores)
+        errors.extend(y_errors)
+        tried += y_tried
+        if y_missing:
+            parts.append("YOLO 가중치 없음")
+        else:
+            parts.append(f"YOLO {len(y_defects)}건")
+
+    if run_unsup and run_yolo:
+        result_backend = "unsup+yolo"
+    elif run_yolo:
+        result_backend = "yolo"
+    else:
+        result_backend = "unsup"
+
+    if tried == 0:
+        return JudgmentResult(
+            verdict="OK",
+            defects=[],
+            scores=scores,
+            backend=result_backend,
+            message="채점할 면 이미지가 없음",
+        )
+    unsup_ok = any(row.get("source") == "unsup" for row in scores)
+    if run_unsup and not unsup_ok and (missing or errors) and not scores:
+        fail = ["비지도 채점 실패"]
+        if missing:
+            fail.append("없는 모델: " + ", ".join(sorted(set(missing))))
+        if errors:
+            fail.append("; ".join(errors[:3]))
+        return JudgmentResult(
+            verdict="NG",
+            defects=[],
+            scores=scores,
+            backend=result_backend,
+            message=" · ".join(fail),
+        )
+    if missing:
+        parts.append("없는 비지도 모델: " + ", ".join(sorted(set(missing))))
+    if errors:
+        parts.append("오류 " + str(len(errors)))
+    return JudgmentResult(
+        verdict="NG" if defects else "OK",
+        defects=defects,
+        scores=scores,
+        backend=result_backend,
+        message=" · ".join(parts),
     )
 
 
@@ -184,6 +412,9 @@ _BACKENDS = {
     "stub": _infer_stub,
     "mock": _infer_mock,
     "model": _infer_model,
+    "unsup": _infer_model,
+    "yolo": _infer_model,
+    "both": _infer_model,
 }
 
 

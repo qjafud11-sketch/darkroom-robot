@@ -23,7 +23,7 @@ from gui_common import (
 )
 from judgment import RESULT_PATH
 from pipeline import FULL_SEQUENCE
-from ui_store import append_record, format_judged_at, list_records, seed_demo_records
+from ui_store import append_record, format_judged_at, remove_demo_records
 
 HOST = "0.0.0.0"
 PORT = 8585
@@ -46,6 +46,7 @@ inspect_wall = None
 
 is_running = False
 stop_requested = False
+cycle_stop_requested = False
 session_total = 0
 session_ok = 0
 current_page = "검사"
@@ -76,7 +77,8 @@ def apply_snapshot(snapshot):
                 operator.set_judgment(snapshot["judgment"], inspect_wall)
         verdict = snapshot.get("verdict")
         cmd = snapshot.get("command", "")
-        if cmd == "REPORT" and verdict in ("OK", "NG") and is_running:
+        finish = cmd in ("REPORT", "JUDGE")
+        if finish and verdict in ("OK", "NG") and is_running:
             session_total += 1
             if verdict == "OK":
                 session_ok += 1
@@ -84,6 +86,8 @@ def apply_snapshot(snapshot):
             append_record(judgment, session_total)
             if records_page:
                 records_page.refresh()
+            if reports_page:
+                reports_page.refresh(scroll=False)
             if operator:
                 operator.set_verdict(verdict, judgment)
                 operator.set_stats(session_total, session_ok)
@@ -116,28 +120,27 @@ def _set_controls(idle=True):
         operator.set_controls(idle=idle)
 
 
-def _prepare_new_run():
-    global stop_requested
-    stop_requested = False
+def _prepare_new_run(clear_inspect=None, reset_verdict=True):
     if inspect_wall:
-        inspect_wall.clear()
-    if operator:
+        inspect_wall.clear(inspect=clear_inspect)
+    if operator and reset_verdict:
         operator.clear_defects()
         operator.show_idle_verdict()
-    if timeline:
+    if timeline and reset_verdict:
         timeline.reset()
     if phase_header:
         phase_header.set_phase("준비 중", sub="공정을 시작합니다", running=True)
 
 
 def _on_step_start(command):
-    label = phase_label(command)
+    timeline_cmd = "BRINGOUT" if command == "JUDGE" else command
+    label = phase_label(command) or phase_label(timeline_cmd)
     if not label:
         return
 
     def update():
         if timeline:
-            timeline.mark_current(command)
+            timeline.mark_current(timeline_cmd)
         if phase_header:
             phase_header.set_phase(label, sub="", running=True)
 
@@ -147,7 +150,7 @@ def _on_step_start(command):
 def _on_step_done(resp):
     cmd = resp.get("command", "")
     if timeline and cmd:
-        timeline.mark_done(cmd)
+        timeline.mark_done("BRINGOUT" if cmd == "JUDGE" else cmd)
     apply_snapshot(resp)
 
 
@@ -178,25 +181,70 @@ def send_step(cmd):
     return True
 
 
-def run_sequence_worker():
-    global is_running, stop_requested
-    _prepare_new_run()
+def run_sequence_worker(sequence=None, clear_inspect=None, reset_verdict=True):
+    global is_running, stop_requested, cycle_stop_requested
+    sequence = sequence or FULL_SEQUENCE
+    cycle = 0
+    halted = False
 
-    for cmd in FULL_SEQUENCE:
+    while True:
+        cycle += 1
+        prepared = threading.Event()
+
+        def prep(cycle_no=cycle, first=cycle == 1):
+            _prepare_new_run(
+                clear_inspect=clear_inspect if first else None,
+                reset_verdict=reset_verdict if first else True,
+            )
+            if phase_header and cycle_no > 1:
+                phase_header.set_phase(
+                    "다음 사이클",
+                    sub=f"{cycle_no}번째 샘플 — 집기부터 다시 시작합니다",
+                    running=True,
+                )
+            prepared.set()
+
+        _on_ui(prep)
+        prepared.wait(timeout=15)
+
         if stop_requested:
+            halted = True
             _on_ui(lambda: phase_header.set_phase(
-                "중지됨", sub="다음 공정을 실행하지 않았습니다",
+                "비상정지",
+                sub="현재 단계까지 마치고 다음 공정은 실행하지 않았습니다",
             ))
             break
-        if not send_step(cmd):
+
+        for cmd in sequence:
+            if stop_requested:
+                halted = True
+                _on_ui(lambda: phase_header.set_phase(
+                    "비상정지",
+                    sub="현재 단계까지 마치고 다음 공정은 실행하지 않았습니다",
+                ))
+                break
+            if not send_step(cmd):
+                halted = True
+                break
+
+        if halted or stop_requested:
             break
+        if cycle_stop_requested:
+            _on_ui(lambda: phase_header.set_phase(
+                "검사 중지",
+                sub=f"이번 사이클({cycle}번째)을 끝까지 마친 뒤 멈췄습니다",
+            ))
+            break
+        print(f"[UI] 사이클 {cycle} 완료 — 처음부터 다시 시작")
 
     is_running = False
+    stop_requested = False
+    cycle_stop_requested = False
     _on_ui(lambda: _set_controls(idle=True))
 
 
-def start_run():
-    global is_running, stop_requested
+def start_run(sequence=None, clear_inspect=None, reset_verdict=True):
+    global is_running, stop_requested, cycle_stop_requested
     if is_running:
         return
     if current_page != "검사":
@@ -208,25 +256,65 @@ def start_run():
         return
     is_running = True
     stop_requested = False
+    cycle_stop_requested = False
     _set_controls(idle=False)
-    threading.Thread(target=run_sequence_worker, daemon=True).start()
+    threading.Thread(
+        target=run_sequence_worker,
+        kwargs={
+            "sequence": sequence,
+            "clear_inspect": clear_inspect,
+            "reset_verdict": reset_verdict,
+        },
+        daemon=True,
+    ).start()
 
 
 def stop_run():
-    global stop_requested
+    """검사 중지 — 이번 사이클 남은 단계를 모두 끝낸 뒤 멈춘다."""
+    global cycle_stop_requested
     if not is_running:
+        if phase_header:
+            phase_header.set_phase("대기", sub="검사가 시작된 뒤에만 중지할 수 있습니다")
         return
-    stop_requested = True
+    cycle_stop_requested = True
+    print("[UI] 검사 중지 — 이번 사이클 끝까지 진행")
     phase_header.set_phase(
         phase_header.phase_var.get(),
-        sub="정지 요청 — 현재 공정 완료 후 멈춤",
+        sub="검사 중지 — 이번 사이클을 끝까지 마친 뒤 멈춥니다",
         running=True,
     )
 
 
-def on_defect_select(_event):
-    sel = operator.listbox.curselection()
-    if sel and inspect_wall:
+def emergency_stop():
+    """비상정지 — 지금 단계가 끝나는 즉시 다음 공정은 하지 않는다."""
+    global stop_requested
+    if not is_running:
+        if phase_header:
+            phase_header.set_phase("대기", sub="검사가 시작된 뒤에만 비상정지할 수 있습니다")
+        return
+    stop_requested = True
+    print("[UI] 비상정지 — 현재 단계 종료 후 중단")
+    phase_header.set_phase(
+        phase_header.phase_var.get(),
+        sub="비상정지 — 현재 단계가 끝나면 바로 멈춥니다",
+        running=True,
+    )
+
+
+def on_defect_select(event):
+    if not inspect_wall or not operator:
+        return
+    widget = event.widget
+    sel = widget.curselection()
+    if not sel:
+        return
+    if widget is getattr(operator, "yolo_list", None):
+        items = getattr(operator, "yolo_items", None)
+    else:
+        items = getattr(operator, "unsup_items", None) or getattr(operator, "list_items", None)
+    if items and 0 <= int(sel[0]) < len(items):
+        inspect_wall.highlight_item(items[int(sel[0])])
+    else:
         inspect_wall.highlight_defect(int(sel[0]))
 
 
@@ -367,7 +455,12 @@ def build_ui():
         on_back=lambda: show_page("검사"),
     )
 
-    operator = OperatorPanel(body, on_run=start_run, on_stop=stop_run)
+    operator = OperatorPanel(
+        body,
+        on_run=start_run,
+        on_stop=stop_run,
+        on_estop=emergency_stop,
+    )
     operator.bind_defect_select(on_defect_select)
     operator.set_stats(0, 0)
     operator.show_idle_verdict()
@@ -386,7 +479,10 @@ if __name__ == "__main__":
     server.start_background()
     start_capture_server(grab_for_pipeline)
     load_saved_judgment()
-    if len([r for r in list_records() if r.get("backend") == "demo"]) < 6:
-        seed_demo_records(force=True)
+    remove_demo_records()
+    if records_page:
+        records_page.refresh()
+    if reports_page:
+        reports_page.refresh()
     root.protocol("WM_DELETE_WINDOW", on_close)
     root.mainloop()

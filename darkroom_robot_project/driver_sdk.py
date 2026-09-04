@@ -5,9 +5,11 @@ J1 베이스 · J2 어깨 · J3 팔꿈치 · J4 손목(상하) · J5 손목(롤)
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 import serial
@@ -32,9 +34,33 @@ JOINT_IDS = [1, 2, 3, 4, 5, 6]
 
 POS_MIN = 0
 POS_MAX = 4095
-# J1 수동 확인 범위. 서보 내부 제한을 변경하지 않고 명령값만 이 범위로 제한한다.
-J1_POS_MIN = 877
-J1_POS_MAX = 3286
+# 실제 가동범위 확인용 진단 모드: joint_limits.json 클램프를 적용하지 않는다.
+# 서보 내부의 과전류·과열 보호는 이 설정과 무관하게 유지된다.
+ENFORCE_JOINT_LIMITS = False
+
+
+def _load_joint_limits() -> dict[int, tuple[int, int]]:
+    """캘리브레이션된 관절별 안전 범위를 읽는다."""
+    path = Path(__file__).with_name("joint_limits.json")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        limits = {}
+        for name, values in data["joints"].items():
+            joint_id = int(name.removeprefix("J"))
+            minimum, maximum = int(values["min"]), int(values["max"])
+            if joint_id not in JOINT_IDS or not POS_MIN <= minimum < maximum <= POS_MAX:
+                raise ValueError(f"잘못된 {name} 범위: {minimum}~{maximum}")
+            limits[joint_id] = (minimum, maximum)
+        if set(limits) != set(JOINT_IDS):
+            raise ValueError("J1~J6 범위가 모두 필요합니다")
+        return limits
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        print(f"[드라이버] joint_limits.json 읽기 실패 — 기본 범위 사용: {exc}")
+        return {sid: (POS_MIN, POS_MAX) for sid in JOINT_IDS}
+
+
+JOINT_LIMITS = _load_joint_limits()
+J1_POS_MIN, J1_POS_MAX = JOINT_LIMITS.get(1, (877, 3286))
 
 
 @dataclass
@@ -178,12 +204,15 @@ class STS3215Driver:
         return self._read_u16(servo_id, ADDR_PRESENT_POSITION)
 
     def set_position(self, servo_id: int, position: int) -> bool:
-        position = int(position)
-        if servo_id == 1:
-            position = max(J1_POS_MIN, min(J1_POS_MAX, position))
-        else:
-            position = max(POS_MIN, min(POS_MAX, position))
-        return self._write_u16(servo_id, ADDR_GOAL_POSITION, position)
+        return self._write_u16(servo_id, ADDR_GOAL_POSITION, self.clamp_position(servo_id, position))
+
+    @staticmethod
+    def clamp_position(servo_id: int, position: int) -> int:
+        position = max(POS_MIN, min(POS_MAX, int(position)))
+        if not ENFORCE_JOINT_LIMITS:
+            return position
+        minimum, maximum = JOINT_LIMITS.get(servo_id, (POS_MIN, POS_MAX))
+        return max(minimum, min(maximum, position))
 
     def set_speed(self, servo_id: int, speed: int) -> bool:
         speed = max(0, min(4095, int(speed)))
@@ -214,10 +243,13 @@ class STS3215Driver:
     def get_all_positions(self) -> dict[int, Optional[int]]:
         return {sid: self.get_position(sid) for sid in JOINT_IDS}
 
-    def set_all_positions(self, positions: dict[int, int]) -> None:
+    def set_all_positions(self, positions: dict[int, int]) -> dict[int, int]:
+        applied = {}
         for sid, pos in positions.items():
             if pos is not None:
-                self.set_position(sid, pos)
+                applied[sid] = self.clamp_position(sid, pos)
+                self.set_position(sid, applied[sid])
+        return applied
 
     def set_all_torque(self, enable: bool) -> None:
         for sid in JOINT_IDS:

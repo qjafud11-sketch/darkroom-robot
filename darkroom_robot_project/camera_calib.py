@@ -241,17 +241,380 @@ def sharpness_score(image):
     return float(ImageStat.Stat(edges).var[0])
 
 
+FOV_SHAPES = ("rect", "ellipse", "circle")
+FOV_SHAPE_LABELS = {
+    "rect": "직사각형",
+    "ellipse": "타원",
+    "circle": "원",
+}
+FOV_DEFAULTS = {
+    "shape": "rect",
+    "x": 0.0,
+    "y": 0.0,
+    "w": 1.0,
+    "h": 1.0,
+}
+FOV_MIN_PX = 32
+FOV_FRAME = (1280, 720)
+
+
+def _clamp_float(value, lo, hi, default):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(hi, number))
+
+
+def _legacy_zoom_box(src):
+    """예전 zoom/cx/cy 저장값을 x,y,w,h 로 바꾼다."""
+    zoom = _clamp_float(src.get("zoom"), 0.0, 400.0, 1.0)
+    if zoom > 4.01:
+        zoom = zoom / 100.0
+    zoom = _clamp_float(zoom, 1.0, 4.0, 1.0)
+    size = 1.0 / zoom
+    cx = _clamp_float(src.get("cx"), 0.0, 1.0, 0.5)
+    cy = _clamp_float(src.get("cy"), 0.0, 1.0, 0.5)
+    return {
+        "shape": "rect",
+        "x": cx - size / 2.0,
+        "y": cy - size / 2.0,
+        "w": size,
+        "h": size,
+    }
+
+
+def normalize_fov(values=None, width=None, height=None):
+    """화각. shape 는 rect/ellipse/circle, x,y,w,h 는 화면 비율(0~1)."""
+    src = dict(values or {})
+    width = int(width or FOV_FRAME[0])
+    height = int(height or FOV_FRAME[1])
+    if "w" not in src and "zoom" in src:
+        src = _legacy_zoom_box(src)
+    shape = str(src.get("shape") or "rect").lower()
+    if shape not in FOV_SHAPES:
+        shape = "rect"
+    min_w = FOV_MIN_PX / max(width, 1)
+    min_h = FOV_MIN_PX / max(height, 1)
+    w = _clamp_float(src.get("w"), min_w, 1.0, 1.0)
+    h = _clamp_float(src.get("h"), min_h, 1.0, 1.0)
+    cx = _clamp_float(src.get("x"), 0.0, 1.0, 0.0) + w / 2.0
+    cy = _clamp_float(src.get("y"), 0.0, 1.0, 0.0) + h / 2.0
+    if shape == "circle":
+        side = min(w * width, h * height, width, height)
+        side = max(float(FOV_MIN_PX), side)
+        w = side / width
+        h = side / height
+    x = _clamp_float(cx - w / 2.0, 0.0, max(0.0, 1.0 - w), 0.0)
+    y = _clamp_float(cy - h / 2.0, 0.0, max(0.0, 1.0 - h), 0.0)
+    return {"shape": shape, "x": x, "y": y, "w": w, "h": h}
+
+
+def fov_active(fov):
+    values = normalize_fov(fov)
+    if values["shape"] != "rect":
+        return True
+    return values["w"] < 0.999 or values["h"] < 0.999 or values["x"] > 0.001 or values["y"] > 0.001
+
+
+def fov_box(width, height, fov):
+    """원본 크기에서 화각 상자 (x0, y0, x1, y1) 포함 좌표."""
+    width, height = int(width), int(height)
+    values = normalize_fov(fov, width, height)
+    if width < 2 or height < 2:
+        return (0, 0, max(0, width - 1), max(0, height - 1))
+    x0 = int(round(values["x"] * width))
+    y0 = int(round(values["y"] * height))
+    crop_w = max(FOV_MIN_PX, min(width, int(round(values["w"] * width))))
+    crop_h = max(FOV_MIN_PX, min(height, int(round(values["h"] * height))))
+    x0 = max(0, min(width - crop_w, x0))
+    y0 = max(0, min(height - crop_h, y0))
+    return (x0, y0, x0 + crop_w - 1, y0 + crop_h - 1)
+
+
+def fov_from_box(width, height, box, shape="rect"):
+    x0, y0, x1, y1 = box
+    width, height = max(int(width), 1), max(int(height), 1)
+    return normalize_fov(
+        {
+            "shape": shape,
+            "x": x0 / width,
+            "y": y0 / height,
+            "w": (x1 - x0 + 1) / width,
+            "h": (y1 - y0 + 1) / height,
+        },
+        width,
+        height,
+    )
+
+
+def _mask_ellipse(image):
+    from PIL import ImageDraw
+
+    mask = Image.new("L", image.size, 0)
+    ImageDraw.Draw(mask).ellipse((0, 0, image.size[0] - 1, image.size[1] - 1), fill=255)
+    out = Image.new("RGB", image.size, (0, 0, 0))
+    out.paste(image, mask=mask)
+    return out
+
+
+def _fit_canvas(image, width, height):
+    """비율을 유지한 채 캔버스에 넣는다. 빈 칸은 검정."""
+    src_w, src_h = image.size
+    if src_w <= 0 or src_h <= 0:
+        return Image.new("RGB", (width, height), (0, 0, 0))
+    scale = min(width / src_w, height / src_h)
+    new_w = max(1, int(round(src_w * scale)))
+    new_h = max(1, int(round(src_h * scale)))
+    resized = image.resize((new_w, new_h), Image.BICUBIC)
+    canvas = Image.new("RGB", (width, height), (0, 0, 0))
+    canvas.paste(resized, ((width - new_w) // 2, (height - new_h) // 2))
+    return canvas
+
+
+def inspect_stage(label) -> int:
+    """1차/2차 라벨 → 1 또는 2."""
+    text = str(label or "").strip()
+    if text.startswith("2"):
+        return 2
+    try:
+        if int(text) == 2:
+            return 2
+    except ValueError:
+        pass
+    return 1
+
+
+def fov_face_key(cam_id, stage=1) -> str | None:
+    from dataset_label import FACES
+
+    stage = 2 if int(stage or 1) == 2 else 1
+    cam_id = int(cam_id)
+    for face in FACES:
+        if int(face["cam"]) == cam_id and int(face["stage"]) == stage:
+            return face["key"]
+    return None
+
+
+def apply_fov(image, fov):
+    """디지털 화각. 직사각형·타원·원. 비율은 유지하고 빈 칸은 검게 둔다."""
+    out = image.convert("RGB")
+    width, height = out.size
+    values = normalize_fov(fov, width, height)
+    if not fov_active(values):
+        return out
+    x0, y0, x1, y1 = fov_box(width, height, values)
+    cropped = out.crop((x0, y0, x1 + 1, y1 + 1))
+    if values["shape"] in ("ellipse", "circle"):
+        cropped = _mask_ellipse(cropped)
+    if cropped.size == (width, height) and values["shape"] == "rect":
+        return cropped
+    return _fit_canvas(cropped, width, height)
+
+
+FOV_COMMENT_PREFIX = b"DRFOV:"
+
+
+def fov_fingerprint(cam_id, fov=None, stage=1):
+    payload = {
+        "id": int(cam_id),
+        "stage": int(stage or 1),
+        "fov": normalize_fov(fov if fov is not None else load_fov(cam_id, stage=stage)),
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def _fov_comment_bytes(cam_id, fov=None, stage=1):
+    return FOV_COMMENT_PREFIX + fov_fingerprint(cam_id, fov, stage=stage).encode("utf-8")
+
+
+def _parse_fov_comment(raw):
+    if not raw:
+        return None
+    if isinstance(raw, str):
+        raw = raw.encode("utf-8", "replace")
+    if not raw.startswith(FOV_COMMENT_PREFIX):
+        return None
+    try:
+        return json.loads(raw[len(FOV_COMMENT_PREFIX) :].decode("utf-8"))
+    except (ValueError, json.JSONDecodeError):
+        return None
+
+
+def _jpeg_comment(image):
+    return image.info.get("comment") if hasattr(image, "info") else None
+
+
+def _save_jpeg(image, path, comment=None):
+    extra = {}
+    if comment:
+        extra["comment"] = comment if isinstance(comment, (bytes, bytearray)) else str(comment).encode("utf-8")
+    image.convert("RGB").save(path, quality=95, subsampling=0, **extra)
+
+
+def fov_already_applied(image, cam_id, fov=None, stage=1):
+    """이 JPEG 에 지금 화각이 이미 들어가 있으면 True. 다시 자르지 않는다."""
+    tagged = _parse_fov_comment(_jpeg_comment(image))
+    if not tagged:
+        return False
+    want = json.loads(fov_fingerprint(cam_id, fov, stage=stage))
+    return tagged.get("fov") == want["fov"] and int(tagged.get("id") or 0) == int(cam_id)
+
+
+def open_camera_rgb(path, cam_id, stage=1):
+    """학습·판정·미리보기가 같은 화각을 보도록 연다. 이미 넣은 사진은 다시 안 자른다.
+
+    샘플 색이 있으면 고정 화각으로 자르지 않고 원본을 돌려준다.
+    크롭은 sample_roi 가 매 장 테두리를 따라 한다.
+    """
+    source = Path(path)
+    image = Image.open(source)
+    fov = load_fov(cam_id, stage=stage)
+    tagged = _parse_fov_comment(_jpeg_comment(image))
+    rgb = image.convert("RGB")
+    if tagged:
+        return rgb
+    if load_sample_color(cam_id, stage=stage):
+        return rgb
+    if not fov_active(fov):
+        return rgb
+    return apply_fov(rgb, fov)
+
+
+def load_fov(cam_id, stage=1):
+    """면(카메라+차수) 화각. 면값이 없으면 카메라 공통값을 쓴다."""
+    store = load_store()
+    stage = inspect_stage(stage) if not isinstance(stage, int) else (2 if stage == 2 else 1)
+    key = fov_face_key(cam_id, stage)
+    if key:
+        face_fov = ((store.get("faces") or {}).get(key) or {}).get("fov")
+        if face_fov:
+            return normalize_fov(face_fov)
+    item = store.get("cameras", {}).get(str(cam_id), {})
+    return normalize_fov(item.get("fov"))
+
+
+def save_fov(cam_id, fov, device="", name="", stage=1):
+    store = load_store()
+    cameras = store.setdefault("cameras", {})
+    item = cameras.setdefault(str(cam_id), {})
+    if device:
+        item["device"] = device
+    if name:
+        item["name"] = name
+    values = normalize_fov(fov)
+    stage = 2 if int(stage or 1) == 2 else 1
+    key = fov_face_key(cam_id, stage)
+    if key:
+        faces = store.setdefault("faces", {})
+        slot = faces.setdefault(key, {})
+        slot["fov"] = values
+        slot["cam"] = int(cam_id)
+        slot["stage"] = stage
+    if stage == 1:
+        item["fov"] = values
+    return _write_store(store)
+
+
+def _clamp_byte(value, default=0):
+    try:
+        number = int(round(float(value)))
+    except (TypeError, ValueError):
+        return default
+    return max(0, min(255, number))
+
+
+def normalize_sample_color(raw):
+    """면마다 찍은 샘플 HSV. picked 가 아니면 아직 없는 것으로 본다."""
+    if not raw or not isinstance(raw, dict):
+        return None
+    if raw.get("picked") is False:
+        return None
+    if "h" not in raw or "s" not in raw or "v" not in raw:
+        return None
+    h = _clamp_byte(raw.get("h"), 40)
+    s = _clamp_byte(raw.get("s"), 40)
+    v = _clamp_byte(raw.get("v"), 170)
+    return {
+        "picked": True,
+        "h": h,
+        "s": s,
+        "v": v,
+        "h_tol": _clamp_byte(raw.get("h_tol"), 22),
+        "s_tol": _clamp_byte(raw.get("s_tol"), 50),
+        "v_tol": _clamp_byte(raw.get("v_tol"), 70),
+    }
+
+
+def load_sample_color(cam_id, stage=1):
+    store = load_store()
+    stage = 2 if int(stage or 1) == 2 else 1
+    key = fov_face_key(cam_id, stage)
+    if not key:
+        return None
+    raw = ((store.get("faces") or {}).get(key) or {}).get("sample_color")
+    return normalize_sample_color(raw)
+
+
+def save_sample_color(cam_id, color, stage=1):
+    store = load_store()
+    stage = 2 if int(stage or 1) == 2 else 1
+    key = fov_face_key(cam_id, stage)
+    if not key:
+        return CALIB_PATH
+    faces = store.setdefault("faces", {})
+    slot = faces.setdefault(key, {})
+    slot["cam"] = int(cam_id)
+    slot["stage"] = stage
+    values = normalize_sample_color(color)
+    if values:
+        slot["sample_color"] = values
+    else:
+        slot.pop("sample_color", None)
+    return _write_store(store)
+
+
+def image_has_fov_tag(path_or_image) -> bool:
+    if isinstance(path_or_image, (str, Path)):
+        image = Image.open(path_or_image)
+    else:
+        image = path_or_image
+    return _parse_fov_comment(_jpeg_comment(image)) is not None
+
+
+def apply_fov_in_place(cam_id, path, stage=1):
+    """촬영 JPEG 에 저장된 면 화각을 바로 넣는다. 이미 넣은 사진은 건너뛴다.
+
+    샘플 색 추적이 켜진 면은 원본 전체를 남겨 둔다. 위치가 조금 바뀌어도
+    나중에 색으로 테두리를 다시 잡기 위해서다.
+    """
+    stage = 2 if int(stage or 1) == 2 else 1
+    if load_sample_color(cam_id, stage=stage):
+        return False
+    fov = load_fov(cam_id, stage=stage)
+    source = Path(path)
+    image = Image.open(source)
+    if _parse_fov_comment(_jpeg_comment(image)):
+        return False
+    if not fov_active(fov):
+        return False
+    rgb = apply_fov(image.convert("RGB"), fov)
+    _save_jpeg(rgb, source, _fov_comment_bytes(cam_id, fov, stage=stage))
+    return True
+
+
 def save_camera(cam_id, device, values, name="", filters=None):
     store = load_store()
     cameras = store.setdefault("cameras", {})
+    prev = cameras.get(str(cam_id), {})
     cameras[str(cam_id)] = {
         "device": device,
         "name": name,
         "controls": {key: int(val) for key, val in values.items()},
         "filters": normalize_filters(filters),
+        "fov": normalize_fov(prev.get("fov")),
     }
-    CALIB_PATH.write_text(json.dumps(store, ensure_ascii=False, indent=2), encoding="utf-8")
-    return CALIB_PATH
+    return _write_store(store)
 
 
 def load_camera(cam_id):
@@ -376,8 +739,11 @@ def save_filtered_in_place(cam_id, path):
     filters = load_filters(cam_id)
     if not filters_active(filters):
         return False
-    image = Image.open(path).convert("RGB")
-    apply_filters(image, filters).save(path, quality=95, subsampling=0)
+    source = Path(path)
+    image = Image.open(source)
+    comment = _jpeg_comment(image)
+    rgb = apply_filters(image.convert("RGB"), filters)
+    _save_jpeg(rgb, source, comment)
     return True
 
 
@@ -392,6 +758,8 @@ def save_ai_copy(cam_id, path):
         return None
     source = Path(path)
     dest = ai_path(source)
-    image = Image.open(source).convert("RGB")
-    apply_filters(image, filters).save(dest, quality=95, subsampling=0)
+    image = Image.open(source)
+    comment = _jpeg_comment(image)
+    rgb = apply_filters(image.convert("RGB"), filters)
+    _save_jpeg(rgb, dest, comment)
     return dest

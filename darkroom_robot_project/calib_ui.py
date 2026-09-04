@@ -84,7 +84,7 @@ class CalibUi:
         tk.Label(top, text="카메라 캘리브레이션", font=("Arial", 14, "bold")).pack(side="left")
         tk.Label(
             top,
-            text="한 대만 켜서 맞춥니다. 이 창은 AI가 받을 그림 기준입니다. 원본 사진은 보정 없이 따로 남습니다.",
+            text="한 대만 켜서 맞춥니다. 이 창은 AI가 받을 그림 기준입니다. 화각(줌)은 python fov_ui.py 에서 맞춥니다.",
             fg="#555",
         ).pack(side="left", padx=12)
 

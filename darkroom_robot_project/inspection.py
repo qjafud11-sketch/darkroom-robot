@@ -2,7 +2,7 @@
 
 조명은 FTDI 아두이노, 서보는 CH340 아두이노. PC가 둘 다 OK를 받은 뒤에만 다음으로 간다.
 조명이 켜진 뒤에 캡처하고, 저장이 끝나야 조명을 끈다.
-8번 판정은 judgment.infer_from_folders — AI는 judgment._infer_model() 에 연결.
+8번 판정은 judgment.infer_from_folders — 비지도 PatchCore + YOLO 를 합친다.
 """
 import time
 
@@ -19,8 +19,10 @@ from servo import rotate_180 as servo_rotate_180
 LED_ON = light_command()
 LED_OFF = "OFF"
 LIGHT_ON = 2.0
-SERVO_MOVE_GAP = 0
-LIGHT_DONE_GAP = 0
+# 보드 OK 만으로는 하중 있는 거치대가 180°를 다 돌기 전에 촬영이 들어가
+# 2차 사진이 1차와 거의 같아졌다. 촬영 전에 이만큼 더 기다린다.
+SERVO_MOVE_GAP = 2.0
+LIGHT_DONE_GAP = 0.3
 
 _capture_manifests: dict[str, str] = {}
 
@@ -51,7 +53,6 @@ def reset_capture_manifests():
 
 def _inspect(label):
     """조명 ON → 그 직후 촬영 → 켜진 지 2초가 안 됐으면 나머지를 채운 뒤 OFF."""
-    door_close()
     control_led("LED_ON")
     started = time.monotonic()
     folder = capture(label)
@@ -60,7 +61,6 @@ def _inspect(label):
     if remain > 0:
         time.sleep(remain)
     control_led("LED_OFF")
-    door_open()
 
 
 def inspection_first():
@@ -79,14 +79,18 @@ def inspection_second():
     print(f"\n[검사] 2차 — 뒤집기 완료 후  서보 {servo_port}  조명 {light_port}")
 
     print("[통신] PC → 서보  180°")
+    t0 = time.monotonic()
     servo_rotate_180()
-    print("[통신] 서보 → PC  OK 180° → 조명")
+    moved = time.monotonic() - t0
+    print(f"[통신] 서보 → PC  OK 180°  ({moved:.1f}s) → 정착 대기")
     if SERVO_MOVE_GAP > 0:
         time.sleep(SERVO_MOVE_GAP)
 
+    door_close()
     print("[통신] PC → 조명  ON → 촬영 → OFF")
     _inspect("2차")
     print("[통신] 조명 → PC  OK OFF → 원위치")
+    door_open()
     if LIGHT_DONE_GAP > 0:
         time.sleep(LIGHT_DONE_GAP)
 

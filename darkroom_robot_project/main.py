@@ -10,7 +10,10 @@ from skills import (
     set_wait,
     task_bringout,
     task_flip,
+    task_grip,
     task_insert,
+    task_sort_ng,
+    task_sort_ok,
 )
 
 
@@ -21,6 +24,7 @@ def run():
 
 TASKS = {
     "run": run,
+    "grip": task_grip,
     "insert": task_insert,
     "inspect_1": inspection_first,
     "flip": task_flip,
@@ -28,12 +32,14 @@ TASKS = {
     "servo_home": servo_home,
     "inspect_2": inspection_second,
     "bringout": task_bringout,
+    "sort_ok": task_sort_ok,
+    "sort_ng": task_sort_ng,
 }
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="암실 로봇 — insert / inspect_1 / flip / servo / servo_home / inspect_2 / bringout / run",
+        description="암실 로봇 — grip / insert / inspect_1 / flip / servo / servo_home / inspect_2 / bringout / sort_ok / sort_ng / run",
     )
     parser.add_argument("task", nargs="?", default="run", choices=list(TASKS))
     parser.add_argument(

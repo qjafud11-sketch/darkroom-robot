@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 1
+names: ['sample-detection']
+
+roboflow:
+  workspace: s-workspace-bj9sj
+  project: sample_detection-qjwqc
+  version: 3
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/s-workspace-bj9sj/sample_detection-qjwqc/dataset/3

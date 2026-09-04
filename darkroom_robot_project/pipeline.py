@@ -1,4 +1,4 @@
-"""목표 순서(0~12) 파이프라인 — 사진 표 기준.
+"""목표 순서(0~12) 파이프라인 — 운영 UI 연속 검사 기준.
 
 자동 시퀀스 FULL_SEQUENCE (0~10, UI 실행):
   0 집기 → 1 투입 → 2 1차검사 → GAP → 4 뒤집기 → 5 2차검사 → GAP
@@ -9,6 +9,7 @@ CLI `main.py run` 은 READY_SEQUENCE (투입~회수, 집기·분류 없음).
 11 카메라 캘리브 · 12 AI — 단독 명령만 (자동 시퀀스 제외).
 """
 import concurrent.futures
+import os
 import time
 
 from inspection import (
@@ -23,13 +24,17 @@ from skills import task_bringout, task_flip, task_insert, task_pick, task_sort
 
 STAGE_GAP = 1.0
 
-# 0 집기만 아직 포즈가 없다. True면 NotImplementedError 를 건너뛴다.
+# 집기 포즈는 skills.task_grip 에 있다. True면 NotImplementedError 만 건너뛴다.
 SKIP_UNIMPLEMENTED = True
 
-# True면 로봇팔(집기·투입·뒤집기·회수·분류)을 움직이지 않는다.
-# 연속 검사에서 조명·카메라·서보·판정만 돌릴 때 켠다.
-SKIP_ROBOT_ARM = True
+# False면 운영 UI 연속 검사가 집기·투입·뒤집기·회수·분류를 실제로 움직인다.
+SKIP_ROBOT_ARM = False
 ARM_COMMANDS = ("PICK", "INSERT", "FLIP", "SORT")
+
+# True면 판정을 stub 항상 OK. robot_client 가 stub 으로 고정한다.
+FORCE_OK_JUDGE = False
+# True면 판정을 mock 항상 NG. 기록·그래프 확인용. FORCE_OK_JUDGE 보다 우선.
+FORCE_NG_JUDGE = True
 
 _state = {"verdict": "OK", "judgment": None}
 
@@ -72,8 +77,20 @@ def ai_infer():
     return result.verdict
 
 
+def apply_forced_judge_backend():
+    """FORCE_NG_JUDGE / FORCE_OK_JUDGE 를 환경변수에 반영한다."""
+    if FORCE_NG_JUDGE:
+        os.environ["JUDGE_BACKEND"] = "mock"
+        os.environ["JUDGE_MOCK_NG"] = "1"
+        return
+    if FORCE_OK_JUDGE:
+        os.environ["JUDGE_BACKEND"] = "stub"
+        os.environ.pop("JUDGE_MOCK_NG", None)
+
+
 def run_judge():
-    """8 — 1·2차 촬영본 기준 OK/NG."""
+    """8 — 1·2차 촬영본 기준 OK/NG. FORCE_NG 면 항상 NG, FORCE_OK 면 항상 OK."""
+    apply_forced_judge_backend()
     verdict = judge_product()
     _state["verdict"] = verdict
     _state["judgment"] = get_last_judgment()

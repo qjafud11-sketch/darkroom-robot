@@ -29,14 +29,20 @@ from skills import (
     set_wait,
     task_bringout,
     task_flip,
+    task_grip,
     task_insert,
+    task_sort_ng,
+    task_sort_ok,
 )
 
 
 TASKS = {
+    "grip": ("0 샘플 집기", task_grip),
     "insert": ("1차 샘플 넣기", task_insert),
     "flip": ("2차 샘플 뒤집기", task_flip),
     "bringout": ("3차 샘플 꺼내기", task_bringout),
+    "sort_ok": ("4차 양품 분류", task_sort_ok),
+    "sort_ng": ("4차 불량 분류", task_sort_ng),
 }
 
 

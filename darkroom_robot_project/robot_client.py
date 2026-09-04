@@ -1,8 +1,10 @@
 import json
+import os
 import socket
 
 from hw_ports import report as report_ports
 from pipeline import PIPELINE_COMMANDS, get_ui_snapshot, run_step
+from ui_store import apply_settings_to_env
 
 HOST = "127.0.0.1"  # 로컬 테스트 시 127.0.0.1, 실제 NUC가 다른 PC라면 해당 IP로 변경
 PORT = 8585
@@ -62,5 +64,33 @@ def run_client():
 
 
 if __name__ == "__main__":
+    settings = apply_settings_to_env()
+    from pipeline import FORCE_NG_JUDGE, FORCE_OK_JUDGE, SKIP_ROBOT_ARM, apply_forced_judge_backend
+
+    apply_forced_judge_backend()
+    backend = os.environ.get("JUDGE_BACKEND", settings.get("judge_backend", "stub"))
+    print(f"[실행기] 판정 백엔드 {backend}")
+    if FORCE_NG_JUDGE:
+        print("[실행기] 테스트 — 판정은 항상 NG (mock)")
+    elif FORCE_OK_JUDGE:
+        print("[실행기] AI 미연결 — 판정은 항상 OK (stub)")
+    print(f"[실행기] 로봇팔 {'정지' if SKIP_ROBOT_ARM else '동작'}")
+    try:
+        from sample_seg import warmup_safe
+
+        warmup_safe()
+    except Exception as exc:
+        print(f"[실행기] 샘플 세그 로드 실패: {exc}", flush=True)
+    if backend in ("unsup", "model", "both", "yolo"):
+        if backend != "yolo":
+            from unsup_infer import warmup
+
+            warmup()
+        try:
+            from yolo_infer import warmup as yolo_warmup
+
+            yolo_warmup()
+        except Exception as exc:
+            print(f"[실행기] YOLO 로드 실패: {exc}", flush=True)
     report_ports()
     run_client()

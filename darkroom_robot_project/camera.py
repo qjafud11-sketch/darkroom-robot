@@ -243,7 +243,7 @@ def grab_stills(
     errors = []
 
     def _one(cam):
-        from camera_calib import apply_saved, save_ai_copy, save_filtered_in_place
+        from camera_calib import apply_fov_in_place, apply_saved, save_ai_copy, save_filtered_in_place
         out = folder / f"{stem.format(cam=cam['id'])}.jpg"
         try:
             apply_saved(cam["id"], cam["device"])
@@ -264,6 +264,10 @@ def grab_stills(
         if result.returncode != 0 or not out.exists() or out.stat().st_size == 0:
             detail = (result.stderr or result.stdout or "촬영 실패").strip().splitlines()
             raise RuntimeError(f"{cam['name']} 촬영 실패: {detail[-1] if detail else 'unknown'}")
+        try:
+            apply_fov_in_place(cam["id"], out, stage=2 if str(label).startswith("2") else 1)
+        except Exception:
+            pass
         ai_file = None
         try:
             if ai_only:

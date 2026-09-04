@@ -31,12 +31,14 @@ _C = {
 }
 
 DEFECT_LABELS = {
+    "unknown": "이상(비지도)",
     "scratch": "스크래치",
     "contamination": "이물",
     "dent": "찌그러짐",
     "edge_break": "모서리 깨짐",
     "dimension": "치수 불량",
     "code_fail": "코드 인식 실패",
+    "mock_defect": "테스트 불량",
 }
 
 PIE_COLORS = ("#22D3EE", "#FB7185", "#FBBF24", "#4ADE80", "#A78BFA", "#F472B6", "#64748B")
@@ -141,7 +143,8 @@ def _font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
 
 
 def defect_label(class_name: str) -> str:
-    return DEFECT_LABELS.get(class_name, class_name or "기타")
+    key = (class_name or "").strip().lower()
+    return DEFECT_LABELS.get(key, class_name or "기타")
 
 
 def _parse_dt(value: str) -> datetime | None:

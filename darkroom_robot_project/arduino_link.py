@@ -59,6 +59,7 @@ class ArduinoBoard:
         self.serial = None
         self.opened = False
         self.port = None
+        self.banner = ""
 
     def resolve_port(self):
         if callable(self.candidates):
@@ -132,6 +133,7 @@ class ArduinoBoard:
                 continue
             self.serial = ser
             self.port = port
+            self.banner = leftover
             print(f"[{self.name}] 포트 {port}")
             if leftover:
                 print(f"[{self.name}] 접속: {leftover}")
@@ -214,3 +216,14 @@ def send_ok(command, timeout=REPLY_TIMEOUT, must_reply=True):
 def send_servo(command, timeout=REPLY_TIMEOUT, must_reply=True):
     """서보 보드에 각도 숫자를 보내고 OK를 기다린다."""
     return _servo.send_ok(command, timeout=timeout, must_reply=must_reply)
+
+
+def servo_banner() -> str:
+    """서보 보드 부팅 배너. 필요하면 포트를 연다."""
+    _servo._get()
+    return _servo.banner or ""
+
+
+def servo_has_doors() -> bool:
+    """플래시된 펌웨어가 open/close 문을 아는지."""
+    return "DOOR" in servo_banner()

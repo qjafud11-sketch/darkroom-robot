@@ -7,14 +7,14 @@
 """
 import time
 
-from arduino_link import send_servo
+from arduino_link import send_servo, servo_has_doors
 
 ANGLE_180 = "180"
 ANGLE_90 = "90"
 ANGLE_HOME = "0"
 REPLY_WAIT = 5.0
-# 도는 시간은 보드가 OK 내기 전 2초(SERVO_WAIT_MS)로 끝낸다.
-SETTLE = 0
+# 보드 OK 직후에도 거치대·시료 관성으로 조금 더 돈다. 촬영 전에 여기서 한 번 더 쉰다.
+SETTLE = 1.0
 
 
 def _move(angle, label):
@@ -43,10 +43,16 @@ def home():
 
 
 def door_open():
-    """자동문을 연다."""
+    """자동문을 연다. 펌웨어에 문 명령이 없으면 건너뛴다."""
+    if not servo_has_doors():
+        print("[서보] 문 열기 건너뜀 — 보드가 open/close 를 모름")
+        return None
     return _move("open", "문 열기")
 
 
 def door_close():
-    """자동문을 닫는다."""
+    """자동문을 닫는다. 펌웨어에 문 명령이 없으면 건너뛴다."""
+    if not servo_has_doors():
+        print("[서보] 문 닫기 건너뜀 — 보드가 open/close 를 모름")
+        return None
     return _move("close", "문 닫기")
