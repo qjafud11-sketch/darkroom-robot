@@ -20,9 +20,12 @@ INST_READ = 0x02
 INST_WRITE = 0x03
 
 # 레지스터 주소
+ADDR_MIN_ANGLE = 9
+ADDR_MAX_ANGLE = 11
 ADDR_TORQUE_ENABLE = 40
 ADDR_GOAL_POSITION = 42
 ADDR_GOAL_SPEED = 46
+ADDR_LOCK = 55
 ADDR_PRESENT_POSITION = 56
 ADDR_PRESENT_LOAD = 60
 ADDR_PRESENT_VOLTAGE = 62
@@ -205,6 +208,49 @@ class STS3215Driver:
 
     def set_position(self, servo_id: int, position: int) -> bool:
         return self._write_u16(servo_id, ADDR_GOAL_POSITION, self.clamp_position(servo_id, position))
+
+    def get_angle_limits(self, servo_id: int) -> tuple[Optional[int], Optional[int]]:
+        for _ in range(3):
+            minimum = self._read_u16(servo_id, ADDR_MIN_ANGLE)
+            maximum = self._read_u16(servo_id, ADDR_MAX_ANGLE)
+            if minimum is not None and maximum is not None:
+                return minimum, maximum
+            time.sleep(0.02)
+        return None, None
+
+    def set_angle_limits(self, servo_id: int, minimum: int, maximum: int) -> bool:
+        """서보 EEPROM 각도 제한. 캘리브가 좁게 박아 둔 값을 넓힐 때 쓴다."""
+        minimum = max(POS_MIN, min(POS_MAX, int(minimum)))
+        maximum = max(POS_MIN, min(POS_MAX, int(maximum)))
+        if minimum >= maximum:
+            raise ValueError(f"J{servo_id} 범위 오류: {minimum}~{maximum}")
+        self.set_torque(servo_id, False)
+        time.sleep(0.05)
+        if not self._write_u8(servo_id, ADDR_LOCK, 0):
+            return False
+        ok = self._write_u16(servo_id, ADDR_MIN_ANGLE, minimum)
+        ok = self._write_u16(servo_id, ADDR_MAX_ANGLE, maximum) and ok
+        self._write_u8(servo_id, ADDR_LOCK, 1)
+        return ok
+
+    def expand_angle_limits_to_json(self) -> list[str]:
+        """EEPROM 범위가 joint_limits.json 보다 좁으면 넓힌다. 줄이지는 않는다."""
+        notes = []
+        for sid in JOINT_IDS:
+            cur_min, cur_max = self.get_angle_limits(sid)
+            json_min, json_max = JOINT_LIMITS[sid]
+            if cur_min is None or cur_max is None:
+                notes.append(f"J{sid} EEPROM 읽기 실패")
+                continue
+            new_min = min(cur_min, json_min)
+            new_max = max(cur_max, json_max)
+            if new_min == cur_min and new_max == cur_max:
+                continue
+            if self.set_angle_limits(sid, new_min, new_max):
+                notes.append(f"J{sid} EEPROM {cur_min}~{cur_max} → {new_min}~{new_max}")
+            else:
+                notes.append(f"J{sid} EEPROM 쓰기 실패")
+        return notes
 
     @staticmethod
     def clamp_position(servo_id: int, position: int) -> int:

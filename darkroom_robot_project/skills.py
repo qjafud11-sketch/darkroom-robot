@@ -12,7 +12,7 @@ from hw_ports import resolve_arm_port
 PORT = resolve_arm_port()
 SPEED = 500
 WAIT = 0.0
-ARRIVE_TICK = 20
+ARRIVE_TICK = 28
 STILL_TICK = 3
 STILL_HOLD = 0.12
 START_GRACE = 0.25
@@ -26,6 +26,39 @@ SCALE_MAX = 2.5
 SPEED_LIMIT = 4095
 
 _driver = STS3215Driver(port=PORT)
+_step_log = None
+_eeprom_synced = False
+
+
+def set_step_logger(fn):
+    """테스트 UI가 스텝 로그를 받을 때 연결한다. None 이면 print만."""
+    global _step_log
+    _step_log = fn
+
+
+def _log(message):
+    print(message)
+    if _step_log is not None:
+        _step_log(message)
+
+
+def prepare_arm():
+    """메인 UI·테스트 UI 공통. 포트 연결 후 EEPROM이 JSON보다 좁으면 넓힌다."""
+    global PORT, _eeprom_synced
+    PORT = resolve_arm_port()
+    _driver.port = PORT
+    if not _driver.is_connected() and not _driver.connect():
+        raise ConnectionError(f"SO-ARM101 연결 실패: {PORT}")
+    if not _eeprom_synced:
+        notes = _driver.expand_angle_limits_to_json()
+        if notes:
+            for note in notes:
+                _log(f"[서보제한] {note}")
+        else:
+            _log("[서보제한] EEPROM이 분류 자세(J1=1050)를 허용함")
+        _eeprom_synced = True
+    _driver.set_all_torque(True)
+    return PORT
 
 
 def set_wait(seconds):
@@ -87,7 +120,7 @@ def _wait_arrival(goal):
         }
 
         if gaps and max(gaps.values()) <= ARRIVE_TICK:
-            return elapsed, "도착"
+            return elapsed, "도착", current
 
         moved = max(
             (
@@ -104,32 +137,53 @@ def _wait_arrival(goal):
             and elapsed >= START_GRACE
             and stamp - reference_time >= STILL_HOLD
         ):
-            left = " ".join(
-                f"J{sid} {gap}틱"
-                for sid, gap in sorted(gaps.items())
-                if gap > ARRIVE_TICK
-            )
-            return elapsed, f"멈춤 {left}" if left else "멈춤"
+            return elapsed, "중간정지", current
 
         if elapsed >= ARRIVE_MAX:
-            left = " ".join(
-                f"J{sid} {gap}틱"
-                for sid, gap in sorted(gaps.items())
-                if gap > ARRIVE_TICK
-            )
-            print(f"[경고] {ARRIVE_MAX}초 내 완료 못 함 — {left}")
-            return elapsed, "시간초과"
+            return elapsed, "시간초과", current
+
+
+def _joint_gap_lines(requested, sent, current):
+    lines = []
+    for sid in JOINT_IDS:
+        want = requested.get(sid)
+        goal = sent.get(sid)
+        now = current.get(sid)
+        if now is None:
+            lines.append(f"J{sid} 현재값 읽기 실패  입력 {want}")
+            continue
+        delta = now - want if want is not None else None
+        text = f"J{sid} 입력 {want}  현재 {now}  차이 {delta:+d}틱"
+        if want is not None and goal is not None and want != goal:
+            text += f"  (제한으로 {want}→{goal} 전송)"
+        lines.append(text)
+    return lines
+
+
+def _log_arrival(index, label, requested, sent, current, took, reason):
+    if reason == "도착":
+        _log(f"[이동] {index} {label}  {took:.2f}초  목표 ±{ARRIVE_TICK}틱 안 도착")
+        return
+    if reason == "중간정지":
+        why = (
+            f"목표 ±{ARRIVE_TICK}틱에 못 미친 채 {STILL_HOLD:.2f}초 이상 거의 안 움직임 "
+            f"(부하·기구 간섭·토크 한계 가능)"
+        )
+    elif reason == "시간초과":
+        why = f"{ARRIVE_MAX:.0f}초 안에 목표에 못 도달"
+    elif reason == "그리퍼 고정대기":
+        why = f"그리퍼만 바꿔 {GRIP_WAIT:.2f}초 고정대기"
+    else:
+        why = reason
+    _log(f"[미도달] {index} {label}  {took:.2f}초  이유: {why}")
+    for line in _joint_gap_lines(requested, sent, current):
+        _log(f"[미도달] {line}")
 
 
 def run_steps(title, steps, step_offset=0, step_waits=None):
-    global PORT
-    PORT = resolve_arm_port()
-    _driver.port = PORT
-    if not _driver.is_connected() and not _driver.connect():
-        raise ConnectionError(f"SO-ARM101 연결 실패: {PORT}")
-    _driver.set_all_torque(True)
+    prepare_arm()
 
-    print(f"\n=== {title} === (속도 배율 {SPEED_SCALE * 100:.0f}%)")
+    _log(f"=== {title} === (속도 배율 {SPEED_SCALE * 100:.0f}%)")
     last = step_offset + sum(kind == "POS" for kind, *_ in steps)
     speeds = {}
     index = step_offset
@@ -143,19 +197,18 @@ def run_steps(title, steps, step_offset=0, step_waits=None):
         pose = rest[0]
         name = rest[1] if len(rest) > 1 else None
         index += 1
-        joints = " | ".join(f"J{sid}:{pose[sid]}" for sid in JOINT_IDS)
         label = name or f"{index}번"
-        print(f"[{label} 자세 실행시작]")
-        print(f"[스텝 {index} 실행중]")
+        _log(f"[{label} 자세 실행시작]")
+        _log(f"[스텝 {index} 실행중]")
 
         scaled, scale = _scaled(speeds)
         speed_text = " | ".join(f"J{sid}:{scaled[sid]}" for sid in JOINT_IDS)
-        print(f"[속도] {index}번 스텝  {speed_text}")
+        _log(f"[속도] {index}번 스텝  {speed_text}")
         for sid in JOINT_IDS:
             _driver.set_speed(sid, scaled[sid])
 
         if scale < SPEED_SCALE - 0.01:
-            print(f"[배율] {index}번 스텝 속도 배율 {scale * 100:.0f}% 적용")
+            _log(f"[배율] {index}번 스텝 속도 배율 {scale * 100:.0f}% 적용")
 
         applied_pose = _driver.set_all_positions(pose)
         changed = [
@@ -164,25 +217,50 @@ def run_steps(title, steps, step_offset=0, step_waits=None):
             if pose.get(sid) != applied_pose.get(sid)
         ]
         if changed:
-            print(f"[캘리브 제한] {' | '.join(changed)}")
+            _log(f"[캘리브 제한] {' | '.join(changed)}")
 
         if _grip_only(pose, previous):
             time.sleep(GRIP_WAIT)
-            took, reason = GRIP_WAIT, "그리퍼 고정대기"
-        else:
-            took, reason = _wait_arrival(applied_pose)
+        took, reason, current = _wait_arrival(applied_pose)
         previous = pose
 
-        print(f"[이동] {index} {label}  {joints}  ({took:.2f}초 · {reason})")
-        print(f"[{label} 자세 실행종료]")
+        _log_arrival(index, label, pose, applied_pose, current, took, reason)
+        _log(f"[{label} 자세 실행종료]")
 
         if step_waits and index in step_waits:
             delay = float(step_waits[index])
-            print(f"[대기] {delay}초")
+            _log(f"[대기] {delay}초")
             time.sleep(delay)
         elif index != last and WAIT > 0:
-            print(f"[대기] {WAIT}초")
+            _log(f"[대기] {WAIT}초")
             time.sleep(WAIT)
+
+
+def list_pose_steps(steps):
+    """POS만 모아 (번호, 속도, 자세, 이름) 목록."""
+    speeds = {}
+    index = 0
+    items = []
+    for kind, *rest in steps:
+        if kind == "SPD":
+            speeds = rest[0]
+            continue
+        index += 1
+        pose = rest[0]
+        name = rest[1] if len(rest) > 1 else None
+        items.append((index, dict(speeds), pose, name))
+    return items
+
+
+def run_pose_step(title, steps, step_no):
+    """한 POS 스텝만 실행. step_no 는 1부터."""
+    items = list_pose_steps(steps)
+    if step_no < 1 or step_no > len(items):
+        raise ValueError(f"{title} 스텝은 1~{len(items)}: {step_no}")
+    index, speeds, pose, name = items[step_no - 1]
+    subset = [("SPD", speeds), ("POS", pose, name) if name else ("POS", pose)]
+    run_steps(f"{title} {index}/{len(items)}", subset, step_offset=index - 1)
+    return pose
 
 
 # 샘플 집기
@@ -247,8 +325,8 @@ FLIP = [
     spd(j1=500, j2=700, j3=500, j4=500, j5=500, j6=500),  # 11
     pos({1: 2060, 2: 2195, 3: 2170, 4: 1525, 5: 3060, 6: 2550}),
     spd(j1=500, j2=500, j3=500, j4=500, j5=900, j6=500),  # 12
-    pos({1: 2020, 2: 2036, 3: 2391, 4: 1570, 5: 1020, 6: 2550}),
-    spd(j1=500, j2=500, j3=500, j4=500, j5=500, j6=500),  # 13
+    pos({1: 2020, 2: 2036, 3: 2391, 4: 1570, 5: 3060, 6: 2550}),
+    spd(j1=500, j2=500, j3=500, j4=500, j5=900, j6=500),  # 13
     pos({1: 2020, 2: 1953, 3: 3122, 4: 910, 5: 1020, 6: 2550}),
 ]
 

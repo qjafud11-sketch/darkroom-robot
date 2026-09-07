@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -23,10 +24,22 @@ from typing import Any
 from PIL import Image, ImageDraw, ImageFilter
 import numpy as np
 
-from dataset_label import FACES, UNSUP_DIR, shot_path
+from dataset_label import CROP_CUM_DIR, FACES, UNSUP_DIR, shot_path
 
 ROI_PATH = UNSUP_DIR / "roi.json"
 MODELS_ROI = Path.home() / "darkroom_models" / "unsup" / "roi.json"
+
+# 운영 GUI 검사 영상은 전체 FOV. True 면 세그 크롭을 보여 준다.
+GUI_SHOW_SAMPLE_CROP = False
+
+
+def show_gui_sample_crop() -> bool:
+    raw = os.environ.get("GUI_SHOW_SAMPLE_CROP", "").strip().lower()
+    if raw in ("0", "false", "no", "off"):
+        return False
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    return GUI_SHOW_SAMPLE_CROP
 
 # 크롭이 너무 작거나 실패하면 이 중앙 윈도우로 떨어진다.
 _FALLBACK = (0.20, 0.05, 0.80, 0.78)
@@ -302,7 +315,22 @@ def paint_outside(rgb: Image.Image, mask: np.ndarray) -> Image.Image:
     return Image.fromarray(out)
 
 
-def _solid_silhouette(mask: np.ndarray) -> np.ndarray:
+def _erode_mask(mask: np.ndarray, iterations: int) -> np.ndarray:
+    if iterations <= 0 or not mask.any():
+        return mask
+    try:
+        from scipy import ndimage
+
+        out = ndimage.binary_erosion(mask, iterations=int(iterations))
+        return out if out.any() else mask
+    except Exception:
+        k = max(3, 2 * int(iterations) + 1)
+        out = Image.fromarray(mask.astype(np.uint8) * 255).filter(ImageFilter.MinFilter(k))
+        out = np.asarray(out) > 127
+        return out if out.any() else mask
+
+
+def _solid_silhouette(mask: np.ndarray, *, grow: int = 6, convex: bool = True) -> np.ndarray:
     """색이 다른 스크래치·찌그러짐을 안으로 남긴 외곽만 남긴다."""
     if not mask.any():
         return mask
@@ -310,14 +338,17 @@ def _solid_silhouette(mask: np.ndarray) -> np.ndarray:
     try:
         from scipy import ndimage
 
-        filled = ndimage.binary_closing(mask, iterations=6)
+        if grow > 0:
+            filled = ndimage.binary_closing(mask, iterations=int(grow))
         filled = ndimage.binary_fill_holes(filled)
     except Exception:
         closed = Image.fromarray(mask.astype(np.uint8) * 255)
-        closed = closed.filter(ImageFilter.MaxFilter(15)).filter(ImageFilter.MinFilter(9))
+        if grow > 0:
+            k = max(3, 2 * int(grow) + 1)
+            closed = closed.filter(ImageFilter.MaxFilter(k)).filter(ImageFilter.MinFilter(max(3, k - 4)))
         filled = np.asarray(closed) > 127
     blob = _largest_blob(filled)
-    return _convex_mask(blob)
+    return _convex_mask(blob) if convex else blob
 
 
 def pick_color(
@@ -389,7 +420,8 @@ def detect_mask_ex(
             seg_note = "Geti 오류"
             print(f"[sample-roi] Geti 실패: {exc}", flush=True)
         if raw is not None and raw.any():
-            return rgb_img, _solid_silhouette(raw), "Geti"
+            mask = _solid_silhouette(raw, grow=2, convex=False)
+            return rgb_img, _erode_mask(mask, 2), "Geti"
         try:
             from sample_seg import predict_mask
 
@@ -403,7 +435,8 @@ def detect_mask_ex(
             seg_note = (seg_note + " · " if seg_note else "") + extra
             print(f"[sample-roi] 세그 실패: {exc}", flush=True)
         if raw is not None and raw.any():
-            return rgb_img, _solid_silhouette(raw), "세그"
+            mask = _solid_silhouette(raw, grow=2, convex=False)
+            return rgb_img, _erode_mask(mask, 2), "세그"
     if color:
         raw = color_mask(rgb_img, color, search_box=search_box)
         source = "색" if not seg_note else f"색 · {seg_note}"
@@ -555,6 +588,89 @@ def _aabb_crop(rgb: Image.Image, box: tuple[int, int, int, int]) -> "CropResult"
     )
 
 
+def _inner_face_box(rgb: Image.Image, min_cover: float = 0.88) -> tuple[int, int, int, int] | None:
+    """검은 여백·둥근 모서리를 빼고, 샘플 면이 가로·세로로 가득 찬 안쪽 상자."""
+    arr = np.asarray(rgb.convert("RGB"))
+    if arr.ndim != 3:
+        return None
+    lum = arr.max(axis=2).astype(np.float32)
+    hi = float(np.percentile(lum, 90)) if lum.size else 0.0
+    fg = lum >= max(14.0, 0.16 * hi)
+    h, w = fg.shape
+    if int(fg.sum()) < 80 * 80:
+        return None
+    row = fg.mean(axis=1)
+    col = fg.mean(axis=0)
+    thr_r = max(min_cover, 0.90 * float(row.max()))
+    thr_c = max(min_cover, 0.90 * float(col.max()))
+    r0, r1, rn = _longest_run(row >= thr_r)
+    c0, c1, cn = _longest_run(col >= thr_c)
+    if rn < 80 or cn < 80:
+        r0, r1 = _proj_span(row, 0.10)
+        c0, c1 = _proj_span(col, 0.10)
+        rn, cn = r1 - r0 + 1, c1 - c0 + 1
+    if rn < 80 or cn < 80:
+        return None
+    inset_x = max(2, int(round(0.02 * cn)))
+    inset_y = max(2, int(round(0.02 * rn)))
+    c0 = min(c0 + inset_x, c1 - 79)
+    r0 = min(r0 + inset_y, r1 - 79)
+    c1 = max(c1 - inset_x, c0 + 79)
+    r1 = max(r1 - inset_y, r0 + 79)
+    c0, r0 = max(0, c0), max(0, r0)
+    c1, r1 = min(w - 1, c1), min(h - 1, r1)
+    if c1 - c0 < 79 or r1 - r0 < 79:
+        return None
+    return c0, r0, c1, r1
+
+
+def _trim_to_face(result: "CropResult") -> "CropResult":
+    """워프·AABB 뒤에 남은 검정 테두리를 잘라 면만 남긴다."""
+    box = _inner_face_box(result.image)
+    if box is None:
+        return result
+    x0, y0, x1, y1 = box
+    w, h = result.image.size
+    if x0 <= 1 and y0 <= 1 and x1 >= w - 2 and y1 >= h - 2:
+        return result
+    cropped = result.image.crop((x0, y0, x1 + 1, y1 + 1))
+    affine = result.affine
+    if affine is not None:
+        a, b, c, d, e, f = affine
+        affine = (a, b, a * x0 + b * y0 + c, d, e, d * x0 + e * y0 + f)
+        nw, nh = cropped.size
+        corners = []
+        aa, bb, cc, dd, ee, ff = affine
+        for x, y in ((0, 0), (nw - 1, 0), (nw - 1, nh - 1), (0, nh - 1)):
+            corners.append([aa * x + bb * y + cc, dd * x + ee * y + ff])
+        xs = [p[0] for p in corners]
+        ys = [p[1] for p in corners]
+        aabb = (
+            int(np.floor(min(xs))),
+            int(np.floor(min(ys))),
+            int(np.ceil(max(xs))),
+            int(np.ceil(max(ys))),
+        )
+    else:
+        ox, oy, _, _ = result.box
+        aabb = (ox + x0, oy + y0, ox + x1, oy + y1)
+        corners = [
+            [float(aabb[0]), float(aabb[1])],
+            [float(aabb[2]), float(aabb[1])],
+            [float(aabb[2]), float(aabb[3])],
+            [float(aabb[0]), float(aabb[3])],
+        ]
+    return CropResult(
+        image=cropped,
+        box=aabb,
+        affine=affine,
+        size=cropped.size,
+        corners=corners,
+        source=result.source,
+        mask=result.mask,
+    )
+
+
 def _warp_obb(
     rgb: Image.Image,
     center: tuple[float, float],
@@ -623,9 +739,11 @@ def crop_detected(
     rgb = paint_outside(rgb, mask)
     obb = _oriented_rect(mask)
     if obb is not None:
-        return _with_meta(_warp_obb(rgb, *obb), source, mask)
-    box = _mask_box(mask) or _fallback_box(w, h)
-    return _with_meta(_aabb_crop(rgb, box), source, mask)
+        cropped = _with_meta(_warp_obb(rgb, *obb), source, mask)
+    else:
+        box = _mask_box(mask) or _fallback_box(w, h)
+        cropped = _with_meta(_aabb_crop(rgb, box), source, mask)
+    return _trim_to_face(cropped)
 
 
 def crop_sample(
@@ -676,6 +794,39 @@ def crop_and_replace(path: str | Path, cam_id: int, stage: int = 1, sample_only:
     return result
 
 
+def archive_operation_crops(manifest_1: dict[str, Any] | None, manifest_2: dict[str, Any] | None) -> int:
+    """운용 판정 때 샘플 면 크롭을 crop_cum 에 쌓는다. 촬영본은 그대로 둔다."""
+    from dataset_label import next_crop_cum_index
+
+    idx = next_crop_cum_index()
+    CROP_CUM_DIR.mkdir(parents=True, exist_ok=True)
+    saved = 0
+    for face in FACES:
+        manifest = manifest_1 if face["stage"] == 1 else manifest_2
+        path = ""
+        for cam in (manifest or {}).get("cameras") or []:
+            if int(cam.get("id", 0)) != face["cam"]:
+                continue
+            path = cam.get("file") or cam.get("ai_file") or ""
+            break
+        if not path or not Path(path).is_file():
+            continue
+        try:
+            _rgb, result = crop_camera(path, face["cam"], stage=face["stage"])
+        except SampleNotFound as exc:
+            print(f"[crop_cum] {face['name']} 건너뜀 — {exc}", flush=True)
+            continue
+        except Exception as exc:
+            print(f"[crop_cum] {face['name']} 실패 — {exc}", flush=True)
+            continue
+        dest = CROP_CUM_DIR / f"crop_cum_{idx}_{face['stage']}_{face['cam']}.jpg"
+        save_sample_crop(dest, result.image)
+        saved += 1
+    if saved:
+        print(f"[crop_cum] {saved}장 → {CROP_CUM_DIR}  (crop_cum_{idx}_*)", flush=True)
+    return idx
+
+
 def crop_camera(
     path: str | Path,
     cam_id: int,
@@ -696,7 +847,8 @@ def crop_camera(
     if is_sample_cropped(path):
         rgb = Image.open(path).convert("RGB")
         w, h = rgb.size
-        return rgb, _with_meta(_aabb_crop(rgb, (0, 0, w - 1, h - 1)), "저장본", None)
+        saved = _trim_to_face(_with_meta(_aabb_crop(rgb, (0, 0, w - 1, h - 1)), "저장본", None))
+        return rgb, saved
     rgb = open_camera_rgb(path, cam_id, stage=stage)
     color = load_sample_color(cam_id, stage=stage)
     search = None

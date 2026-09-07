@@ -227,7 +227,7 @@ def grab_stills(
     USB 대역 때문에 세 대를 동시에 열지 않고 순서대로 찍는다.
     cam_ids 를 주면 그 번호만 찍는다. 2차 검사처럼 일부만 필요할 때 쓴다.
     folder 를 주면 그 폴더에 넣는다. 안 주면 라벨+시각으로 새로 만든다.
-    stem 은 파일 이름 틀이다. {cam} 자리에 카메라 번호가 들어간다.
+    stem 은 파일 이름 틀이거나 cam_id → 이름 함수다. 틀이면 {cam} 자리에 카메라 번호가 들어간다.
     데이터 수집은 "sample_001_1_{cam}" 처럼 줘서 이름만 보고 구분하게 한다.
     ai_only 면 보정본 한 장만 남긴다. 어노테이션용 수집이 이걸 쓴다.
     검사 촬영은 기본값(원본 + _ai 보정본)을 쓴다.
@@ -244,7 +244,8 @@ def grab_stills(
 
     def _one(cam):
         from camera_calib import apply_fov_in_place, apply_saved, save_ai_copy, save_filtered_in_place
-        out = folder / f"{stem.format(cam=cam['id'])}.jpg"
+        name = stem(cam["id"]) if callable(stem) else stem.format(cam=cam["id"])
+        out = folder / f"{name}.jpg"
         try:
             apply_saved(cam["id"], cam["device"])
         except Exception:

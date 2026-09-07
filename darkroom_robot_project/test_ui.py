@@ -26,6 +26,7 @@ from skills import (
     SCALE_MIN,
     set_grip_wait,
     set_speed_scale,
+    set_step_logger,
     set_wait,
     task_bringout,
     task_flip,
@@ -98,6 +99,8 @@ class TestUi:
         self._build_speed_control()
         self._build_task_buttons()
         self._build_log_area()
+
+        set_step_logger(lambda message: self.root.after(0, self.log, message))
 
         self.comm = CommClient(
             host_getter=self.host_var.get,

@@ -126,12 +126,14 @@
     3. GUI에 "라즈베리파이가 연결되었습니다" 가 뜨면 버튼 사용
 
   포트가 바뀌었을 때
-    로봇이 ttyACM0이 아니면 skills.py PORT 수정
-    아두이노가 ttyUSB0이 아니면 inspection.py ARDUINO_PORT 수정
-    둘 다 꽂은 뒤 dmesg | tail 로 어느 장치가 어느 포트인지 확인
+    프로젝트 루트에서 python3 hw_ports.py 로 전체 포트와 카메라 슬롯을 확인한다.
+    실행 시 시리얼 번호(by-id)·허브 자리(by-path)를 우선하고,
+    조명/서보는 READY NeoPixel·READY SERVO 배너로 역할을 확인하므로
+    ttyACM0·ttyUSB0 같은 번호를 skills.py나 inspection.py에 직접 수정하지 않는다.
+    장치가 안 보이면 ls /dev/ttyACM* /dev/ttyUSB* 와 dmesg | tail 로 연결 상태를 확인한다.
 
 단독 실행 (파이 없이, 로봇이 이 PC에 직접 붙은 경우)
-  로봇 USB → 이 PC의 /dev/ttyACM0
-  아두이노 USB → 이 PC의 /dev/ttyUSB0  (조명까지 쓸 때)
+  로봇 USB·아두이노 USB를 이 PC에 연결한다. 실제 번호는 매번 달라질 수 있다.
+  실행 전에 python3 hw_ports.py 로 확인한다.
   python test_ui.py  또는  python main.py
   이 경우에는 gui_server / robot_client 를 쓰지 않는다

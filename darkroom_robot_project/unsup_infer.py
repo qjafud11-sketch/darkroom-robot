@@ -176,7 +176,6 @@ def _heatmap_bbox(anomaly_map, orig_w: int, orig_h: int, valid=None) -> list[int
 def _image_batch(path: Path, face_key: str):
     import numpy as np
     import torch
-    from anomalib.data import ImageBatch
 
     from sample_roi import crop_camera
 
@@ -194,7 +193,18 @@ def _image_batch(path: Path, face_key: str):
     arr = np.asarray(cropped).copy()
     tensor = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).contiguous().float() / 255.0
     full_w, full_h = rgb.size
-    return ImageBatch(image=tensor), full_w, full_h, result.box, cropped.size, result.affine
+
+    class _Batch:
+        def __init__(self, image):
+            self.image = image
+            self.gt_mask = None
+
+        def replace(self, **kwargs):
+            for key, value in kwargs.items():
+                setattr(self, key, value)
+            return self
+
+    return _Batch(tensor), full_w, full_h, result.box, cropped.size, result.affine
 
 
 def score_image(path: str | Path, face_key: str) -> dict[str, Any]:
@@ -208,11 +218,14 @@ def score_image(path: str | Path, face_key: str) -> dict[str, Any]:
     model = bundle["model"]
     device = bundle["device"]
     batch, full_w, full_h, crop_box, crop_size, affine = _image_batch(path, face_key)
-    batch = _prepare_batch(batch, model, device)
+    batch = _prepare_batch(batch, model, device, apply_transform=True)
     model.eval()
     with torch.no_grad():
         pred = model.model(batch.image)
-    amap = getattr(pred, "anomaly_map", None)
+    if isinstance(pred, dict):
+        amap = pred.get("anomaly_map")
+    else:
+        amap = getattr(pred, "anomaly_map", None)
     rgb = batch.image[0]
     score = masked_anomaly_score(amap, rgb) if amap is not None else 0.0
     crop_w, crop_h = crop_size
@@ -231,6 +244,7 @@ def score_image(path: str | Path, face_key: str) -> dict[str, Any]:
         "ratio": (score / threshold) if threshold > 0 else 0.0,
         "ng": score > threshold,
         "bbox": bbox,
+        "crop_bbox": local,
         "crop": list(crop_box),
     }
 

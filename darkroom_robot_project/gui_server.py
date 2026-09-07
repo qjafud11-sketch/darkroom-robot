@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import queue
 import threading
 import tkinter as tk
 
@@ -23,7 +24,7 @@ from gui_common import (
 )
 from judgment import RESULT_PATH
 from pipeline import FULL_SEQUENCE
-from ui_store import append_record, format_judged_at, remove_demo_records
+from ui_store import append_record, flush_archives_to_stats, format_judged_at, remove_demo_records
 
 HOST = "0.0.0.0"
 PORT = 8585
@@ -51,10 +52,43 @@ session_total = 0
 session_ok = 0
 current_page = "검사"
 
+_ui_queue: queue.Queue = queue.Queue()
+_UI_POLL_MS = 40
+_UI_POLL_BUSY_MS = 8
+_UI_BATCH_MAX = 32
+
 
 def _on_ui(fn):
-    if root:
-        root.after(0, fn)
+    """작업 스레드의 UI 요청을 Tk 메인 스레드로 전달한다."""
+    _ui_queue.put(fn)
+
+
+def _drain_ui_queue():
+    """Tk 메인 스레드에서 대기 중인 UI 요청을 처리한다."""
+    processed = 0
+    for _ in range(_UI_BATCH_MAX):
+        try:
+            fn = _ui_queue.get_nowait()
+        except queue.Empty:
+            break
+        processed += 1
+        try:
+            fn()
+        except Exception as exc:
+            if root is not None:
+                root.report_callback_exception(type(exc), exc, exc.__traceback__)
+
+    if root is not None:
+        try:
+            root.after(_UI_POLL_BUSY_MS if processed else _UI_POLL_MS, _drain_ui_queue)
+        except tk.TclError:
+            pass
+
+
+def _start_ui_dispatcher():
+    """GUI 생성 스레드에서 한 번만 큐 처리를 시작한다."""
+    if root is not None:
+        root.after(0, _drain_ui_queue)
 
 
 def _update_stats():
@@ -68,32 +102,41 @@ def apply_snapshot(snapshot):
 
     def update():
         global session_total, session_ok
-        if snapshot.get("captures") and inspect_wall:
-            inspect_wall.load_capture_folders(snapshot["captures"])
-        if snapshot.get("judgment"):
-            if inspect_wall:
-                inspect_wall.set_judgment(snapshot["judgment"])
-            if operator:
-                operator.set_judgment(snapshot["judgment"], inspect_wall)
-        verdict = snapshot.get("verdict")
         cmd = snapshot.get("command", "")
+        judgment = snapshot.get("judgment")
+        captures = snapshot.get("captures")
+        # 집기·투입 등 응답에도 직전 촬영이 실려 있으면 다음 사이클 화면이 다시 채워진다.
+        show_caps = (not cmd) or cmd in ("INSPECT_1", "INSPECT_2", "BRINGOUT", "JUDGE", "REPORT")
+        show_judge = (not cmd) or cmd in ("BRINGOUT", "JUDGE", "REPORT")
+        if inspect_wall and captures and show_caps:
+            inspect_wall.load_capture_folders(captures, refresh=not (judgment and show_judge))
+        if judgment and show_judge:
+            if inspect_wall:
+                inspect_wall.set_judgment(judgment)
+            if operator:
+                operator.set_judgment(judgment, inspect_wall)
+        verdict = snapshot.get("verdict")
         finish = cmd in ("REPORT", "JUDGE")
         if finish and verdict in ("OK", "NG") and is_running:
             session_total += 1
             if verdict == "OK":
                 session_ok += 1
-            judgment = snapshot.get("judgment") or {}
-            append_record(judgment, session_total)
+            judgment = judgment or {}
+            if not snapshot.get("_archived"):
+                append_record(judgment, session_total)
             if records_page:
                 records_page.refresh()
             if reports_page:
-                reports_page.refresh(scroll=False)
+                reports_page.mark_stale()
             if operator:
                 operator.set_verdict(verdict, judgment)
                 operator.set_stats(session_total, session_ok)
             if phase_header:
                 phase_header.set_phase("검사 완료", sub=f"결과 {verdict}")
 
+    if root is not None and threading.current_thread() is threading.main_thread():
+        update()
+        return
     _on_ui(update)
 
 
@@ -165,7 +208,8 @@ def send_step(cmd):
     try:
         resp = server.send(cmd)
     except Exception as exc:
-        _on_ui(lambda: phase_header.set_phase("통신 오류", sub=str(exc), error=True))
+        message = str(exc)
+        _on_ui(lambda message=message: phase_header.set_phase("통신 오류", sub=message, error=True))
         return False
 
     if resp is None:
@@ -173,6 +217,19 @@ def send_step(cmd):
         return False
 
     status = resp.get("status")
+    if status == "DONE":
+        cmd_name = resp.get("command", "")
+        verdict = resp.get("verdict")
+        if (
+            is_running
+            and cmd_name in ("REPORT", "JUDGE")
+            and verdict in ("OK", "NG")
+        ):
+            try:
+                rec = append_record(resp.get("judgment") or {}, session_total + 1)
+                resp["_archived"] = rec
+            except Exception as exc:
+                print(f"[UI] 기록 저장 실패: {exc}")
     _on_ui(lambda: _on_step_done(resp))
 
     if status != "DONE":
@@ -193,8 +250,8 @@ def run_sequence_worker(sequence=None, clear_inspect=None, reset_verdict=True):
 
         def prep(cycle_no=cycle, first=cycle == 1):
             _prepare_new_run(
-                clear_inspect=clear_inspect if first else None,
-                reset_verdict=reset_verdict if first else True,
+                clear_inspect=None if cycle_no > 1 else clear_inspect,
+                reset_verdict=True if cycle_no > 1 else reset_verdict,
             )
             if phase_header and cycle_no > 1:
                 phase_header.set_phase(
@@ -370,8 +427,7 @@ def load_saved_judgment():
 def grab_for_pipeline(label):
     manifest = grab_stills(label, cam_ids=cam_ids_for_label(label))
     folder = manifest["folder"]
-    if inspect_wall and root:
-        root.after(0, lambda: inspect_wall.load_capture_folders({label: folder}))
+    _on_ui(lambda: inspect_wall and inspect_wall.load_capture_folders({label: folder}))
     return manifest
 
 
@@ -438,7 +494,7 @@ def build_ui():
     phase_header.pack(fill="x")
     timeline = TimelineStrip(status_card)
     timeline.pack(fill="x", pady=(10, 0))
-    inspect_wall = InspectWall(inspect_page)
+    inspect_wall = InspectWall(inspect_page, use_sample_crop=False)
 
     records_page = RecordsPage(
         center_stack,
@@ -469,20 +525,26 @@ def build_ui():
 
 
 def on_close():
+    try:
+        flush_archives_to_stats()
+    except Exception as exc:
+        print(f"[UI] 리포트 수치 저장 실패: {exc}")
     root.destroy()
+
+
+def _load_deferred():
+    remove_demo_records()
+    flush_archives_to_stats()
+    load_saved_judgment()
 
 
 if __name__ == "__main__":
     build_ui()
+    _start_ui_dispatcher()
     server.on_connect = on_executor_connect
     server.on_disconnect = on_executor_disconnect
     server.start_background()
     start_capture_server(grab_for_pipeline)
-    load_saved_judgment()
-    remove_demo_records()
-    if records_page:
-        records_page.refresh()
-    if reports_page:
-        reports_page.refresh()
+    root.after(50, _load_deferred)
     root.protocol("WM_DELETE_WINDOW", on_close)
     root.mainloop()

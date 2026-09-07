@@ -6,29 +6,61 @@ import socket
 import threading
 import time
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timedelta
 from io import BytesIO
 from pathlib import Path
 import tkinter as tk
-from tkinter import DISABLED, END, NORMAL, Button, Canvas, Entry, Frame, Label, Listbox, Scrollbar, StringVar, ttk
+from tkinter import (
+    BooleanVar,
+    Button,
+    Canvas,
+    Checkbutton,
+    DISABLED,
+    END,
+    Entry,
+    Frame,
+    Label,
+    Listbox,
+    NORMAL,
+    Scrollbar,
+    StringVar,
+    ttk,
+)
 from tkinter import font as tkfont
 
 from PIL import Image, ImageDraw, ImageTk
 
 from camera import CAMERAS, CAPTURE_DIR, connected_cameras
-from judgment import RESULT_PATH, image_path_from_cam, load_manifest
+from judgment import (
+    RESULT_PATH,
+    image_path_from_cam,
+    load_manifest,
+    merge_unsup_yolo_boxes,
+    overlay_highlight_index,
+)
 from ui_store import (
     RECORDS_ROOT,
+    STATS_PATH,
+    LABELED_ROOT,
     clear_history,
+    delete_records,
+    export_ng_xlsx,
     format_judged_at,
     history_summary,
+    list_labeled_days,
+    list_labeled_records,
     list_records,
+    list_report_days,
     load_settings,
+    report_day,
     save_settings,
     settings_env_snippet,
 )
 
 CELL_SIZE = (340, 190)
+
+# 검사 영상 크롭 표시 롤백: sample_roi.GUI_SHOW_SAMPLE_CROP = False
+# 또는 실행 전 GUI_SHOW_SAMPLE_CROP=0
 
 # 검사 면 구성 — 촬영은 1차 4장 + 2차 2장. 화면은 면 1~6을 3×2로 보여 준다.
 INSPECT_FACES = {
@@ -89,19 +121,10 @@ def defect_line(item: dict) -> str:
     if threshold > 0:
         mark = "NG" if ng or (ng is None and score >= threshold) else "OK"
         if 0 <= score <= 1.5 and 0 < threshold <= 1.5:
-            return (
-                f"  {face_label(inspect, face_id)}  {inspect}  "
-                f"{mark}  {name}  {score * 100:.0f}%"
-            )
-        return (
-            f"  {face_label(inspect, face_id)}  {inspect}  "
-            f"{mark}  {name}  {score:.1f}/{threshold:.1f}"
-        )
+            return f"  {face_label(inspect, face_id)}  {mark}  {name}  {score * 100:.0f}%"
+        return f"  {face_label(inspect, face_id)}  {mark}  {name}  {score:.1f}/{threshold:.1f}"
     percent = score * 100 if score <= 1.5 else score
-    return (
-        f"  {face_label(inspect, face_id)}  {inspect}  "
-        f"{name}  {percent:.0f}%"
-    )
+    return f"  {face_label(inspect, face_id)}  {name}  {percent:.0f}%"
 
 
 LIVE_BACKENDS = ("unsup", "model", "both", "yolo", "unsup+yolo")
@@ -270,6 +293,24 @@ def ensure_ui_theme(root: tk.Misc | None = None) -> ttk.Style:
             ("!active", COLORS["scrollbar"]),
         ],
     )
+    style.configure(
+        "Dark.Date.TCombobox",
+        fieldbackground=COLORS["bg_cell"],
+        background=COLORS["bg_card"],
+        foreground=COLORS["text_primary"],
+        arrowcolor=COLORS["text_secondary"],
+        bordercolor=COLORS["border"],
+        lightcolor=COLORS["bg_cell"],
+        darkcolor=COLORS["bg_cell"],
+        padding=6,
+    )
+    style.map(
+        "Dark.Date.TCombobox",
+        fieldbackground=[("readonly", COLORS["bg_cell"]), ("disabled", COLORS["bg_cell"])],
+        foreground=[("readonly", COLORS["text_primary"])],
+        selectbackground=[("readonly", COLORS["accent_soft"])],
+        selectforeground=[("readonly", COLORS["accent"])],
+    )
     _THEME_READY = True
     return style
 
@@ -364,17 +405,116 @@ def _overlay_bboxes(img, bboxes, highlight_idx=-1, orig_size=None):
         draw.rectangle(box, outline="#EF4444", width=width)
 
 
-def render_image(path, bboxes=None, highlight_idx=-1, size=CELL_SIZE, cam_id=None, inspect=None):
+_CROP_PREVIEW_CACHE: dict[tuple, Image.Image] = {}
+_WALL_RGB_CACHE: dict[tuple, tuple] = {}
+_THUMB_CACHE: dict[tuple, ImageTk.PhotoImage] = {}
+_CACHE_CAP = 48
+
+
+def _cache_put(store: dict, key, value, cap: int = _CACHE_CAP):
+    store[key] = value
+    while len(store) > cap:
+        store.pop(next(iter(store)), None)
+
+
+def _open_rgb_draft(path, max_size=None) -> tuple[Image.Image, tuple[int, int]]:
+    """JPEG는 칸 크기로 디코드할 수 있다. 박스와 같이 쓸 때는 max_size=None."""
+    img = Image.open(path)
+    native = img.size
+    if max_size and img.format == "JPEG":
+        try:
+            img.draft("RGB", max_size)
+        except OSError:
+            pass
+    return img.convert("RGB"), native
+
+
+def _load_wall_image(path, cam_id=None, inspect=None, crop=None, max_size=None) -> tuple[Image.Image, tuple[int, int]]:
+    """표시 이미지와 박스 좌표계 크기. 판정과 같은 open_camera_rgb / 크롭을 쓴다."""
+    from sample_roi import SampleNotFound, crop_camera, show_gui_sample_crop
+
+    want_crop = show_gui_sample_crop() if crop is None else bool(crop)
+    if cam_id is not None and want_crop:
+        from camera_calib import inspect_stage
+
+        key = (str(path), int(cam_id), str(inspect or ""), Path(path).stat().st_mtime_ns)
+        cached = _CROP_PREVIEW_CACHE.get(key)
+        if cached is not None:
+            img = cached.copy()
+            return img, img.size
+        try:
+            _rgb, result = crop_camera(path, int(cam_id), stage=inspect_stage(inspect))
+            img = result.image.convert("RGB")
+            _cache_put(_CROP_PREVIEW_CACHE, key, img, 24)
+            return img.copy(), img.size
+        except (SampleNotFound, OSError, FileNotFoundError):
+            pass
     if cam_id is not None:
         from camera_calib import inspect_stage, open_camera_rgb
 
-        img = open_camera_rgb(path, cam_id, stage=inspect_stage(inspect))
+        rgb = open_camera_rgb(path, int(cam_id), stage=inspect_stage(inspect))
+        return rgb, rgb.size
+    return _open_rgb_draft(path, max_size)
+
+
+def render_image(path, bboxes=None, highlight_idx=-1, size=CELL_SIZE, cam_id=None, inspect=None, crop=None):
+    from sample_roi import show_gui_sample_crop
+
+    mtime = Path(path).stat().st_mtime_ns
+    want_crop = show_gui_sample_crop() if crop is None else bool(crop)
+    # 박스가 있으면 JPEG draft를 쓰지 않는다. 디코드 크기와 좌표 공간이 어긋난다.
+    decode_size = None if bboxes else size
+    rgb_key = (str(path), mtime, cam_id, str(inspect or ""), want_crop, tuple(size), bool(bboxes))
+    cached = _WALL_RGB_CACHE.get(rgb_key)
+    if cached is None:
+        img, orig_size = _load_wall_image(
+            path, cam_id=cam_id, inspect=inspect, crop=crop, max_size=decode_size,
+        )
+        img.thumbnail(size, Image.BILINEAR)
+        _cache_put(_WALL_RGB_CACHE, rgb_key, (img, orig_size))
     else:
-        img = Image.open(path).convert("RGB")
-    orig_size = img.size
-    img.thumbnail(size)
-    _overlay_bboxes(img, bboxes, highlight_idx, orig_size=orig_size)
-    return ImageTk.PhotoImage(img)
+        img, orig_size = cached
+    work = img.copy()
+    _overlay_bboxes(work, bboxes, highlight_idx, orig_size=orig_size)
+    return ImageTk.PhotoImage(work)
+
+
+def render_judgment_preview(judgment, size, highlight_idx=-1):
+    """기록·리포트 미리보기. 전체 화면 좌표 bbox를 촬영본에 그린다."""
+    from ui_store import preview_source_and_boxes
+
+    src, boxes, cam_id, inspect = preview_source_and_boxes(judgment)
+    if not src or not Path(src).is_file():
+        return None
+    try:
+        return render_image(
+            src,
+            boxes,
+            highlight_idx=highlight_idx,
+            size=size,
+            cam_id=cam_id or None,
+            inspect=inspect,
+            crop=False,
+        )
+    except OSError:
+        return None
+
+
+def preview_photo(path, size) -> ImageTk.PhotoImage | None:
+    if not path or not Path(path).is_file():
+        return None
+    key = (str(path), Path(path).stat().st_mtime_ns, tuple(size))
+    cached = _THUMB_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        img, _native = _open_rgb_draft(path, size)
+        img.thumbnail(size, Image.BILINEAR)
+        photo = ImageTk.PhotoImage(img)
+    except OSError:
+        return None
+    _cache_put(_THUMB_CACHE, key, photo, 96)
+    return photo
 
 
 class Card(Frame):
@@ -405,7 +545,7 @@ def rounded_image(w: int, h: int, radius: int, fill: str, surface: str) -> Image
     cached = _ROUND_CACHE.get(key)
     if cached is not None:
         return cached
-    scale = 4
+    scale = 2
     img = Image.new("RGB", (w * scale, h * scale), surface)
     draw = ImageDraw.Draw(img)
     box = (0, 0, w * scale - 1, h * scale - 1)
@@ -413,7 +553,7 @@ def rounded_image(w: int, h: int, radius: int, fill: str, surface: str) -> Image
         draw.rounded_rectangle(box, radius=radius * scale, fill=fill)
     except AttributeError:
         draw.rectangle(box, fill=fill)
-    photo = ImageTk.PhotoImage(img.resize((w, h), Image.LANCZOS))
+    photo = ImageTk.PhotoImage(img.resize((w, h), Image.BILINEAR))
     _ROUND_CACHE[key] = photo
     return photo
 
@@ -695,7 +835,7 @@ class RecordDetailPanel(Frame):
         )
         self.verdict_sub_label.pack(pady=(4, 0))
 
-        _section_label(body, "미리보기", subtitle="샘플 6면 그리드 요약")
+        _section_label(body, "미리보기", subtitle="샘플 면 크롭 요약")
         preview_card = Frame(body, bg=COLORS["bg_cell"], highlightthickness=0)
         preview_card.pack(fill="x", padx=4, pady=(0, 4))
         self.preview_label = Label(
@@ -706,7 +846,9 @@ class RecordDetailPanel(Frame):
         _section_label(body, "검사 영상", subtitle=f"총 {INSPECT_FACE_TOTAL}면")
         self.wall_host = Frame(body, bg=COLORS["bg_card"])
         self.wall_host.pack(fill="x", padx=4)
-        self.inspect_wall = InspectWall(self.wall_host, cell_size=(228, 128), auto_pack=False, show_header=False)
+        self.inspect_wall = InspectWall(
+            self.wall_host, cell_size=(228, 128), auto_pack=False, show_header=False, use_sample_crop=False,
+        )
         self.inspect_wall.pack(fill="x")
 
         _section_label(body, "비지도")
@@ -833,15 +975,12 @@ class RecordDetailPanel(Frame):
         self._scroll.scroll_to_top()
 
         preview = record.get("preview", "")
-        if preview and Path(preview).is_file():
-            try:
-                img = Image.open(preview).convert("RGB")
-                img.thumbnail((520, 220))
-                photo = ImageTk.PhotoImage(img)
-                self._photos["preview"] = photo
-                self.preview_label.config(image=photo, text="")
-            except OSError:
-                self.preview_label.config(image="", text="미리보기 로드 실패", fg=COLORS["ng"])
+        photo = render_judgment_preview(judgment, (520, 220))
+        if photo is None:
+            photo = preview_photo(preview, (520, 220))
+        if photo is not None:
+            self._photos["preview"] = photo
+            self.preview_label.config(image=photo, text="")
         else:
             self.preview_label.config(image="", text="미리보기 없음", fg=COLORS["text_dim"])
 
@@ -903,14 +1042,18 @@ class RecordsPage(Frame):
         self._records = []
         self._filtered = []
         self._selected_id = None
+        self._checked_ids: set[int] = set()
         self._filter = "all"
         self._card_photos = {}
         self._card_frames = {}
+        self._check_vars: dict = {}
+        self._stale = True
+        self._pending_thumbs: list = []
 
         header = Frame(self, bg=COLORS["bg_root"], padx=12, pady=10)
         header.pack(fill="x")
         Label(header, text="검사 기록", font=FONT_TITLE, fg=COLORS["text_primary"], bg=COLORS["bg_root"]).pack(side="left")
-        self.summary_var = __import__("tkinter").StringVar(value="샘플 1건 = 6면 · 폴더 1개")
+        self.summary_var = StringVar(value="이번 실행 폴더만 표시 · 재시작 시 이미지는 지우고 수치는 리포트에 남김")
         Label(
             header, textvariable=self.summary_var, font=FONT_SMALL,
             fg=COLORS["text_secondary"], bg=COLORS["bg_root"],
@@ -948,7 +1091,11 @@ class RecordsPage(Frame):
         self._filter_wrap.pack(side="left")
         PillButton(btn_row, "↩ 검사 화면", self._go_back, variant="secondary").pack(side="left", padx=(12, 0))
         PillButton(btn_row, "새로고침", self.refresh, variant="secondary").pack(side="left", padx=(8, 0))
+        PillButton(btn_row, "보이는 항목 전체 선택", self._check_visible, variant="secondary").pack(side="left", padx=(8, 0))
+        PillButton(btn_row, "선택 해제", self._uncheck_all, variant="ghost").pack(side="left", padx=(8, 0))
+        PillButton(btn_row, "NG 엑셀", self._export_ng, variant="secondary").pack(side="right", padx=(8, 0))
         PillButton(btn_row, "기록 전체 삭제", self._clear, variant="danger").pack(side="right")
+        PillButton(btn_row, "선택 삭제", self._delete_selected, variant="danger").pack(side="right", padx=(0, 8))
 
         body = Frame(self, bg=COLORS["bg_root"])
         body.pack(fill="both", expand=True, padx=12, pady=(0, 12))
@@ -960,9 +1107,9 @@ class RecordsPage(Frame):
         grid_card.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
         Label(grid_card, text="샘플 폴더", font=FONT_HEAD, fg=COLORS["text_primary"], bg=COLORS["bg_card"]).pack(anchor="w")
         Label(
-            grid_card, text=f"저장 위치  {RECORDS_ROOT}", font=FONT_SMALL,
-            fg=COLORS["text_dim"], bg=COLORS["bg_card"], anchor="w",
-        ).pack(fill="x", pady=(2, 8))
+            grid_card, text="체크박스로 고른 뒤 선택 삭제 · NG 엑셀",
+            font=FONT_SMALL, fg=COLORS["text_dim"], bg=COLORS["bg_card"], anchor="w",
+        ).pack(fill="x", pady=(0, 8))
 
         grid_wrap = Frame(grid_card, bg=COLORS["bg_card"])
         grid_wrap.pack(fill="both", expand=True)
@@ -1041,6 +1188,8 @@ class RecordsPage(Frame):
             child.destroy()
         self._card_photos.clear()
         self._card_frames.clear()
+        self._check_vars.clear()
+        self._pending_thumbs = []
 
         if not self._filtered:
             msg = "해당 조건의 샘플이 없습니다." if self._records else (
@@ -1061,11 +1210,20 @@ class RecordsPage(Frame):
             card.grid(row=row, column=col, padx=6, pady=6, sticky="n")
 
         selected = next((r for r in self._filtered if r.get("id") == self._selected_id), None)
-        if selected is None:
+        if selected is None and self.winfo_ismapped():
             selected = self._filtered[0]
-        self._select_record(selected, scroll=False)
+        if selected is not None:
+            self._select_record(selected, scroll=False)
+        self.after(1, self._drain_thumbs)
 
-    def refresh(self):
+    def mark_stale(self):
+        self._stale = True
+
+    def refresh(self, force=False):
+        if not force and not self.winfo_ismapped():
+            self._stale = True
+            return
+        self._stale = False
         self._records = list_records()
         summary = history_summary(self._records)
         self.stat_vars["Total"].set(str(summary["total"]))
@@ -1073,7 +1231,7 @@ class RecordsPage(Frame):
         self.stat_vars["NG"].set(str(summary["ng"]))
         self.stat_vars["OK Rate"].set(summary["rate"])
         self.summary_var.set(
-            f"샘플 {summary['total']}건 · 6면/건 · {RECORDS_ROOT.name}/"
+            f"이번 실행 {summary['total']}건 · 재시작 시 이미지는 삭제 · 수치는 리포트 유지"
         )
         self._apply_filter()
         self._render_cards()
@@ -1082,14 +1240,38 @@ class RecordsPage(Frame):
         rec_id = record.get("id")
         verdict = record.get("verdict", "—")
         badge_fg = COLORS["ok"] if verdict == "OK" else COLORS["ng"] if verdict == "NG" else COLORS["text_dim"]
-        border = COLORS["border_active"] if rec_id == self._selected_id else COLORS["bg_glass"]
+        checked = rec_id in self._checked_ids
+        border = (
+            COLORS["warn"] if checked else
+            COLORS["border_active"] if rec_id == self._selected_id else
+            COLORS["bg_glass"]
+        )
 
         card = Frame(
             parent, bg=COLORS["bg_glass"], cursor="hand2",
-            highlightbackground=border, highlightthickness=2 if rec_id == self._selected_id else 1,
+            highlightbackground=border, highlightthickness=2 if rec_id == self._selected_id or checked else 1,
             width=self.CARD_W,
         )
         self._card_frames[rec_id] = card
+
+        check_row = Frame(card, bg=COLORS["bg_glass"])
+        check_row.pack(fill="x", padx=8, pady=(6, 0))
+        var = BooleanVar(value=bool(checked))
+        self._check_vars[rec_id] = var
+        Checkbutton(
+            check_row,
+            text="삭제 선택",
+            variable=var,
+            command=lambda rid=rec_id: self._on_check(rid),
+            bg=COLORS["bg_glass"],
+            fg=COLORS["text_primary"],
+            selectcolor=COLORS["bg_card"],
+            activebackground=COLORS["bg_glass"],
+            activeforeground=COLORS["text_primary"],
+            highlightthickness=0,
+            bd=0,
+            font=FONT_SMALL,
+        ).pack(side="left", anchor="w")
 
         status_bar = Frame(card, bg=badge_fg if verdict in ("OK", "NG") else COLORS["border"], height=3)
         status_bar.pack(fill="x")
@@ -1102,15 +1284,8 @@ class RecordsPage(Frame):
         img_label.place(relx=0, rely=0, relwidth=1, relheight=1)
 
         preview = record.get("preview", "")
-        if preview and Path(preview).is_file():
-            try:
-                img = Image.open(preview).convert("RGB")
-                img.thumbnail((self.CARD_W - 20, 108))
-                photo = ImageTk.PhotoImage(img)
-                self._card_photos[rec_id] = photo
-                img_label.config(image=photo, text="")
-            except OSError:
-                img_label.config(text="미리보기")
+        size = (self.CARD_W - 20, 108)
+        self._pending_thumbs.append((rec_id, record, img_label, size, preview))
 
         pill_bg = COLORS["ok_bg"] if verdict == "OK" else COLORS["ng_bg"] if verdict == "NG" else COLORS["bg_card_alt"]
         pill = Label(
@@ -1151,14 +1326,29 @@ class RecordsPage(Frame):
             bind_click(child)
         return card
 
+    def _drain_thumbs(self):
+        budget = 6
+        while budget and self._pending_thumbs:
+            budget -= 1
+            rec_id, record, img_label, size, preview = self._pending_thumbs.pop(0)
+            if not img_label.winfo_exists():
+                continue
+            photo = render_judgment_preview(record.get("judgment") or record, size)
+            if photo is None:
+                photo = preview_photo(preview, size)
+            if photo is None:
+                continue
+            self._card_photos[rec_id] = photo
+            try:
+                img_label.config(image=photo, text="")
+            except tk.TclError:
+                pass
+        if self._pending_thumbs:
+            self.after(8, self._drain_thumbs)
+
     def _select_record(self, record, scroll=True):
         self._selected_id = record.get("id")
-        for rec_id, frame in self._card_frames.items():
-            selected = rec_id == self._selected_id
-            frame.config(
-                highlightbackground=COLORS["border_active"] if selected else COLORS["bg_glass"],
-                highlightthickness=2 if selected else 1,
-            )
+        self._paint_card_borders()
         self.detail.show_record(record)
         if scroll and record.get("id") in self._card_frames:
             frame = self._card_frames[record["id"]]
@@ -1166,16 +1356,96 @@ class RecordsPage(Frame):
             y = frame.winfo_y()
             self.grid_canvas.yview_moveto(max(0, (y - 20) / max(1, self.grid_inner.winfo_height())))
 
+    def _paint_card_borders(self):
+        for rec_id, frame in self._card_frames.items():
+            selected = rec_id == self._selected_id
+            checked = rec_id in self._checked_ids
+            frame.config(
+                highlightbackground=(
+                    COLORS["warn"] if checked else
+                    COLORS["border_active"] if selected else
+                    COLORS["bg_glass"]
+                ),
+                highlightthickness=2 if selected or checked else 1,
+            )
+
+    def _on_check(self, rec_id):
+        var = self._check_vars.get(rec_id)
+        if var is not None and var.get():
+            self._checked_ids.add(rec_id)
+        else:
+            self._checked_ids.discard(rec_id)
+        self._paint_card_borders()
+
+    def _check_visible(self):
+        for rec in self._filtered:
+            rec_id = rec.get("id")
+            self._checked_ids.add(rec_id)
+            var = self._check_vars.get(rec_id)
+            if var is not None:
+                var.set(True)
+        self._paint_card_borders()
+
+    def _uncheck_all(self):
+        self._checked_ids.clear()
+        for var in self._check_vars.values():
+            var.set(False)
+        self._paint_card_borders()
+
+    def _ids_to_delete(self):
+        return sorted(self._checked_ids)
+
+    def _delete_selected(self):
+        import tkinter.messagebox as mb
+
+        ids = self._ids_to_delete()
+        if not ids:
+            mb.showinfo("선택 삭제", "삭제할 기록의 체크박스를 켜 주세요.")
+            return
+        if mb.askyesno("선택 삭제", f"체크한 기록 {len(ids)}건을 삭제할까요?"):
+            delete_records(ids)
+            self._checked_ids.difference_update(ids)
+            if self._selected_id in ids:
+                self._selected_id = None
+            self.refresh()
+
+    def _export_ng(self):
+        from tkinter import filedialog
+        import tkinter.messagebox as mb
+
+        ng = [r for r in self._records if str(r.get("verdict", "")).upper() == "NG"]
+        if not ng:
+            mb.showinfo("NG 엑셀", "내보낼 NG 기록이 없습니다.")
+            return
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = filedialog.asksaveasfilename(
+            title="NG 기록 엑셀 저장",
+            defaultextension=".xlsx",
+            filetypes=[("Excel", "*.xlsx")],
+            initialfile=f"darkroom_ng_{stamp}.xlsx",
+            initialdir=str(Path.home() / "Downloads"),
+        )
+        if not path:
+            return
+        try:
+            dest = export_ng_xlsx(path, self._records)
+        except Exception as exc:
+            mb.showerror("NG 엑셀", f"저장 실패: {exc}")
+            return
+        mb.showinfo("NG 엑셀", f"NG {len(ng)}건을 저장했습니다.\n{dest}")
+
     def _clear(self):
         import tkinter.messagebox as mb
         if not self._records:
             return
         if mb.askyesno(
             "기록 전체 삭제",
-            f"저장된 샘플 폴더 {len(self._records)}건과 이미지를 모두 삭제할까요?\n\n{RECORDS_ROOT}",
+            f"이번 실행 폴더 {len(self._records)}건과 이미지만 삭제할까요?\n"
+            f"리포트 누적 수치는 그대로 둡니다.\n\n{RECORDS_ROOT}",
         ):
             clear_history()
             self._selected_id = None
+            self._checked_ids.clear()
             self.refresh()
 
 
@@ -1187,9 +1457,11 @@ class ReportsPage(Frame):
         ensure_ui_theme(parent.winfo_toplevel())
         self.on_back = on_back
         self.on_open_record = on_open_record
-        self._period = "day"
+        self._day = report_day()
+        self._follow_today = True
         self._photos: dict[str, Any] = {}
         self._ng_rows: list[dict] = []
+        self._stale = True
 
         header = Frame(self, bg=COLORS["bg_root"])
         header.pack(fill="x", padx=16, pady=(12, 6))
@@ -1197,21 +1469,34 @@ class ReportsPage(Frame):
         title_col.pack(side="left", fill="y")
         Label(title_col, text="통계 및 리포트", font=("Segoe UI", 18, "bold"), fg=COLORS["text_primary"], bg=COLORS["bg_root"]).pack(anchor="w")
         Label(
-            title_col, text="Quality Control · SPC · 불량 분석",
+            title_col, text="일일 리포트 · 자정이 지나면 다음 날 파일로 넘어갑니다",
             font=FONT_SMALL, fg=COLORS["text_secondary"], bg=COLORS["bg_root"],
         ).pack(anchor="w", pady=(4, 0))
 
         ctrl = Frame(header, bg=COLORS["bg_root"])
         ctrl.pack(side="right")
-        self._period_wrap, self._period_btns = _pill_group(
-            ctrl,
-            (("day", "일"), ("week", "주"), ("month", "월")),
-            self._set_period,
-            self._period,
+        Label(ctrl, text="날짜", font=FONT_SMALL, fg=COLORS["text_dim"], bg=COLORS["bg_root"]).pack(
+            side="left", padx=(0, 6),
         )
-        self._period_wrap.pack(side="left", padx=(0, 10))
+        PillButton(ctrl, "◀", self._prev_day, variant="ghost", padx=12).pack(side="left", padx=2)
+        self._day_var = StringVar(value=self._day)
+        self._day_combo = ttk.Combobox(
+            ctrl,
+            textvariable=self._day_var,
+            state="readonly",
+            width=12,
+            font=FONT_BODY,
+            style="Dark.Date.TCombobox",
+        )
+        self._day_combo.pack(side="left", padx=2, ipady=4)
+        self._day_combo.bind("<<ComboboxSelected>>", self._on_combo_day)
+        PillButton(ctrl, "▶", self._next_day, variant="ghost", padx=12).pack(side="left", padx=2)
+        PillButton(ctrl, "달력", self._open_calendar, variant="secondary").pack(side="left", padx=(8, 2))
+        PillButton(ctrl, "오늘", self._go_today, variant="secondary").pack(side="left", padx=2)
         PillButton(ctrl, "↻", self.refresh, variant="ghost", padx=15).pack(side="left", padx=2)
         PillButton(ctrl, "검사 화면", self._go_back, variant="secondary").pack(side="left", padx=(6, 0))
+        self._fill_day_combo()
+        self.after(5000, self._tick_midnight)
 
         kpi = Frame(self, bg=COLORS["bg_root"], padx=16)
         kpi.pack(fill="x", pady=(4, 10))
@@ -1295,14 +1580,149 @@ class ReportsPage(Frame):
         ).pack(anchor="w", pady=(12, 0))
         self._selected_ng: dict | None = None
 
+    def _fill_day_combo(self):
+        days = list(reversed(list_report_days()))
+        if self._day not in days:
+            days = [self._day] + days
+        self._day_combo["values"] = days
+        if self._day_combo.get() != self._day:
+            self._day_combo.set(self._day)
+
+    def _select_day(self, day: str, follow: bool | None = None):
+        today = report_day()
+        try:
+            datetime.strptime(day, "%Y-%m-%d")
+        except ValueError:
+            return
+        if day > today:
+            day = today
+        self._day = day
+        self._follow_today = today == day if follow is None else follow
+        self.refresh()
+
+    def _on_combo_day(self, _event=None):
+        day = (self._day_combo.get() or "").strip()[:10]
+        if day and day != self._day:
+            self._select_day(day)
+
+    def _sync_day_label(self):
+        self._fill_day_combo()
+
+    def _go_today(self):
+        self._select_day(report_day(), follow=True)
+
+    def _prev_day(self):
+        day = datetime.strptime(self._day, "%Y-%m-%d") - timedelta(days=1)
+        self._select_day(day.strftime("%Y-%m-%d"), follow=False)
+
+    def _next_day(self):
+        today = report_day()
+        nxt = (datetime.strptime(self._day, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+        if nxt > today:
+            return
+        self._select_day(nxt)
+
+    def _open_calendar(self):
+        if getattr(self, "_cal_win", None) is not None:
+            try:
+                self._cal_win.lift()
+                self._cal_win.focus_force()
+                return
+            except tk.TclError:
+                self._cal_win = None
+        win = tk.Toplevel(self)
+        self._cal_win = win
+        win.title("리포트 날짜")
+        win.configure(bg=COLORS["bg_card"])
+        win.resizable(False, False)
+        win.transient(self.winfo_toplevel())
+        marked = set(list_report_days())
+        cursor = [datetime.strptime(self._day, "%Y-%m-%d").replace(day=1)]
+
+        head = Frame(win, bg=COLORS["bg_card"])
+        head.pack(fill="x", padx=10, pady=(10, 4))
+        title = StringVar()
+        grid = Frame(win, bg=COLORS["bg_card"])
+        grid.pack(padx=10, pady=(0, 10))
+
+        def draw():
+            for child in grid.winfo_children():
+                child.destroy()
+            base = cursor[0]
+            title.set(base.strftime("%Y년 %m월"))
+            today = report_day()
+            for i, name in enumerate(("월", "화", "수", "목", "금", "토", "일")):
+                Label(
+                    grid, text=name, width=4, font=FONT_SMALL,
+                    fg=COLORS["text_dim"], bg=COLORS["bg_card"],
+                ).grid(row=0, column=i, pady=(0, 4))
+            first_wd = (base.weekday())  # Mon=0
+            row = 1
+            col = first_wd
+            day_num = 1
+            if base.month == 12:
+                nxt = base.replace(year=base.year + 1, month=1)
+            else:
+                nxt = base.replace(month=base.month + 1)
+            last = (nxt - timedelta(days=1)).day
+            while day_num <= last:
+                stamp = base.replace(day=day_num).strftime("%Y-%m-%d")
+                future = stamp > today
+                has = stamp in marked
+                selected = stamp == self._day
+                if selected:
+                    bg, fg = COLORS["accent"], COLORS["bg_root"]
+                elif has:
+                    bg, fg = COLORS["accent_soft"], COLORS["accent"]
+                else:
+                    bg, fg = COLORS["bg_cell"], COLORS["text_dim"] if future else COLORS["text_primary"]
+                btn = Label(
+                    grid, text=str(day_num), width=4, font=FONT_BODY,
+                    fg=fg, bg=bg, padx=4, pady=4,
+                    cursor="" if future else "hand2",
+                )
+                btn.grid(row=row, column=col, padx=1, pady=1)
+                if not future:
+                    btn.bind("<Button-1>", lambda _e, d=stamp: pick(d))
+                col += 1
+                if col > 6:
+                    col = 0
+                    row += 1
+                day_num += 1
+
+        def pick(day: str):
+            win.destroy()
+            self._cal_win = None
+            self._select_day(day)
+
+        def shift(months: int):
+            y, m = cursor[0].year, cursor[0].month + months
+            while m < 1:
+                y -= 1
+                m += 12
+            while m > 12:
+                y += 1
+                m -= 12
+            cursor[0] = cursor[0].replace(year=y, month=m, day=1)
+            draw()
+
+        PillButton(head, "◀", lambda: shift(-1), variant="ghost", padx=10).pack(side="left")
+        Label(head, textvariable=title, font=FONT_HEAD, fg=COLORS["text_primary"], bg=COLORS["bg_card"]).pack(
+            side="left", expand=True,
+        )
+        PillButton(head, "▶", lambda: shift(1), variant="ghost", padx=10).pack(side="right")
+        win.protocol("WM_DELETE_WINDOW", lambda: (setattr(self, "_cal_win", None), win.destroy()))
+        draw()
+
+    def _tick_midnight(self):
+        today = report_day()
+        if self._follow_today and self._day != today:
+            self._select_day(today, follow=True)
+        self.after(5000, self._tick_midnight)
+
     def _go_back(self):
         if self.on_back:
             self.on_back()
-
-    def _set_period(self, key: str):
-        self._period = key
-        _set_segment_active(self._period_btns, key)
-        self.refresh()
 
     def _set_chart(self, label: Label, key: str, pil_image):
         from PIL import ImageTk
@@ -1310,10 +1730,18 @@ class ReportsPage(Frame):
         self._photos[key] = photo
         label.config(image=photo)
 
-    def refresh(self, scroll=True):
+    def mark_stale(self):
+        self._stale = True
+
+    def refresh(self, scroll=True, force=False):
+        if not force and not self.winfo_ismapped():
+            self._stale = True
+            return
+        self._stale = False
         from reports_analytics import build_report_bundle
 
-        bundle = build_report_bundle(self._period)
+        bundle = build_report_bundle(day=self._day)
+        self._sync_day_label()
         s = bundle["summary"]
         total = s["total"]
         ng = s["ng"]
@@ -1366,15 +1794,13 @@ class ReportsPage(Frame):
             thumb = Label(inner, bg=COLORS["bg_cell"], width=108, height=62)
             thumb.pack(side="left", padx=(10, 8), pady=10)
             preview = item.get("preview", "")
-            if preview and Path(preview).is_file():
-                try:
-                    img = Image.open(preview).convert("RGB")
-                    img.thumbnail((108, 62))
-                    photo = ImageTk.PhotoImage(img)
-                    self._photos[f"ng_{idx}"] = photo
-                    thumb.config(image=photo, width=108, height=62)
-                except OSError:
-                    thumb.config(text="—")
+            rec = item.get("record") or {}
+            photo = render_judgment_preview(rec.get("judgment") or rec, (108, 62))
+            if photo is None:
+                photo = preview_photo(preview, (108, 62))
+            if photo is not None:
+                self._photos[f"ng_{idx}"] = photo
+                thumb.config(image=photo, width=108, height=62)
 
             info = Frame(inner, bg=COLORS["bg_glass"])
             info.pack(side="left", fill="both", expand=True, padx=(0, 10), pady=10)
@@ -1417,15 +1843,13 @@ class ReportsPage(Frame):
             f"불량 유형  {item.get('defect_types', '—')}"
         )
         preview = item.get("preview", "")
-        if preview and Path(preview).is_file():
-            try:
-                img = Image.open(preview).convert("RGB")
-                img.thumbnail((560, 220))
-                photo = ImageTk.PhotoImage(img)
-                self._photos["detail"] = photo
-                self._detail_preview.config(image=photo, text="")
-            except OSError:
-                self._detail_preview.config(image="", text="미리보기 없음")
+        rec = item.get("record") or {}
+        photo = render_judgment_preview(rec.get("judgment") or rec, (560, 220))
+        if photo is None:
+            photo = preview_photo(preview, (560, 220))
+        if photo is not None:
+            self._photos["detail"] = photo
+            self._detail_preview.config(image=photo, text="")
         else:
             self._detail_preview.config(image="", text="미리보기 없음")
 
@@ -1473,7 +1897,7 @@ class SettingsPage(Frame):
         Label(judge_card, text="판정 (AI)", font=FONT_HEAD, fg=COLORS["text_primary"], bg=COLORS["bg_card"]).pack(anchor="w")
         self._add_field(judge_card, "judge_backend", "백엔드", hint="unsup(비지도+YOLO) · yolo · both · stub · mock")
         self._add_field(judge_card, "judge_score_min", "YOLO NG 임계값", hint="confidence 0~1. 비지도는 면별 학습 문턱")
-        self._add_field(judge_card, "judge_model_path", "YOLO 모델 경로", hint="비우면 crop640/weights/best.pt")
+        self._add_field(judge_card, "judge_model_path", "YOLO 모델 경로", hint="비우면 openvino/defect_det/model.xml")
         self._add_field(judge_card, "history_max", "기록 보관 한도", hint="검사 기록 최대 건수")
 
         hw_card = Card(scroll_wrap, padx=14, pady=14)
@@ -1549,7 +1973,8 @@ class SettingsPage(Frame):
 
     def refresh_paths(self, tcp_port=8585, capture_port=8586):
         self.path_var.set(
-            f"검사 기록  {RECORDS_ROOT}\n"
+            f"검사 기록(이번 실행)  {RECORDS_ROOT}\n"
+            f"리포트 수치  {STATS_PATH}/YYYY-MM-DD.jsonl\n"
             f"촬영 저장  {CAPTURE_DIR}\n"
             f"최근 판정  {RESULT_PATH}\n"
             f"TCP (실행기)  {tcp_port}\n"
@@ -1813,8 +2238,6 @@ class OperatorPanel(Card):
         self.yolo_items = []
         self.unsup_summary.set("판정 후 표시")
         self.yolo_summary.set("스크래치 · 찌그러짐")
-        if self.inspect_wall:
-            self.inspect_wall.highlight_defect(-1)
 
     def set_judgment(self, judgment, inspect_wall=None):
         if inspect_wall is not None:
@@ -1882,15 +2305,18 @@ class VerdictBar(Card):
 
 
 class InspectWall(Frame):
-    def __init__(self, parent, cell_size=CELL_SIZE, auto_pack=True, show_header=True):
+    def __init__(self, parent, cell_size=CELL_SIZE, auto_pack=True, show_header=True, use_sample_crop=None):
         super().__init__(parent, bg=COLORS["bg_root"])
         self.cell_size = cell_size
+        self.use_sample_crop = use_sample_crop
         if auto_pack:
             self.pack(fill="both", expand=True)
         self.cells = {}
         self.photos = {}
         self.judgment = {}
         self.manifests = {}
+        self._cell_sig = {}
+        self._highlight = None
 
         outer = Card(self, padx=10, pady=10)
         outer.pack(fill="both", expand=True, padx=8, pady=8)
@@ -1898,44 +2324,34 @@ class InspectWall(Frame):
             Label(outer, text="검사 영상", font=FONT_HEAD, fg=COLORS["text_primary"], bg=COLORS["bg_card"]).pack(anchor="w")
             self.subtitle = Label(
                 outer,
-                text="1차 4면 · 2차 2면 (임시 분리)",
+                text="면 1~6  ·  3×2",
                 font=FONT_SMALL, fg=COLORS["text_dim"], bg=COLORS["bg_card"],
             )
             self.subtitle.pack(anchor="w", pady=(0, 8))
         else:
             self.subtitle = None
 
-        sections = Frame(outer, bg=COLORS["bg_card"])
-        sections.pack(fill="both", expand=True)
-        section_meta = (
-            ("1차", "1차 검사", "카메라 1~4"),
-            ("2차", "2차 검사", "카메라 3·4 · 서보 180°"),
-        )
-        for inspect, title, hint in section_meta:
-            block = Frame(sections, bg=COLORS["bg_card"])
-            block.pack(fill="both", expand=True, pady=(0, 8))
-            head = Frame(block, bg=COLORS["bg_card"])
-            head.pack(fill="x", pady=(0, 4))
-            Label(head, text=title, font=FONT_HEAD, fg=COLORS["text_primary"], bg=COLORS["bg_card"]).pack(side="left")
-            Label(head, text=hint, font=FONT_SMALL, fg=COLORS["text_dim"], bg=COLORS["bg_card"]).pack(side="left", padx=(10, 0))
-            grid = Frame(block, bg=COLORS["bg_card"])
-            grid.pack(fill="both", expand=True)
-            faces = INSPECT_FACES[inspect]
-            cols = max(len(faces), 1)
-            for col in range(cols):
-                grid.columnconfigure(col, weight=1)
-            grid.rowconfigure(0, weight=1)
-            for col, face in enumerate(faces):
-                face_id = int(face["id"])
-                wrap = Frame(grid, bg=COLORS["bg_cell"], highlightthickness=0)
-                wrap.grid(row=0, column=col, padx=5, pady=5, sticky="nsew")
-                Label(
-                    wrap, text=face["name"], font=FONT_SMALL,
-                    fg=COLORS["text_dim"], bg=COLORS["bg_cell"],
-                ).pack(anchor="w", padx=8, pady=(6, 0))
-                cell = Label(wrap, text="—", bg=COLORS["bg_cell"], fg=COLORS["text_dim"], relief="flat")
-                cell.pack(fill="both", expand=True, padx=4, pady=4)
-                self.cells[(inspect, face_id)] = cell
+        grid = Frame(outer, bg=COLORS["bg_card"])
+        grid.pack(fill="both", expand=True)
+        cols = INSPECT_GRID_COLS
+        rows = max(1, (len(INSPECT_GRID) + cols - 1) // cols)
+        for col in range(cols):
+            grid.columnconfigure(col, weight=1, uniform="face")
+        for row in range(rows):
+            grid.rowconfigure(row, weight=1, uniform="face")
+        for idx, face in enumerate(INSPECT_GRID):
+            row, col = divmod(idx, cols)
+            inspect = face["inspect"]
+            face_id = int(face["id"])
+            wrap = Frame(grid, bg=COLORS["bg_cell"], highlightthickness=0)
+            wrap.grid(row=row, column=col, padx=5, pady=5, sticky="nsew")
+            Label(
+                wrap, text=f"{face['name']}  ·  {inspect}", font=FONT_SMALL,
+                fg=COLORS["text_dim"], bg=COLORS["bg_cell"],
+            ).pack(anchor="w", padx=8, pady=(6, 0))
+            cell = Label(wrap, text="—", bg=COLORS["bg_cell"], fg=COLORS["text_dim"], relief="flat")
+            cell.pack(fill="both", expand=True, padx=4, pady=4)
+            self.cells[(inspect, face_id)] = cell
 
     def clear(self, inspect=None):
         if inspect:
@@ -1944,9 +2360,13 @@ class InspectWall(Frame):
                 if key[0] == inspect:
                     cell.config(image="", text="—")
                     self.photos.pop(key, None)
+                    self._cell_sig.pop(key, None)
             return
         self.manifests.clear()
         self.judgment = {}
+        self._cell_sig.clear()
+        self._highlight = None
+        self.photos.clear()
         for cell in self.cells.values():
             cell.config(image="", text="—")
 
@@ -1954,24 +2374,46 @@ class InspectWall(Frame):
         self.judgment = judgment or {}
         self._refresh_all_cells()
 
-    def load_capture_folders(self, captures):
+    def load_capture_folders(self, captures, refresh=True):
+        changed = []
         for label, folder in (captures or {}).items():
             if not folder:
                 continue
             manifest = load_manifest(folder)
             if manifest:
                 self.manifests[label] = manifest
-        self._refresh_all_cells()
+                changed.append(label)
+        if refresh and changed:
+            self._refresh_all_cells(only_inspect=changed)
+
+    def _crop_enabled(self) -> bool:
+        from sample_roi import show_gui_sample_crop
+
+        if self.use_sample_crop is not None:
+            return bool(self.use_sample_crop)
+        return show_gui_sample_crop()
+
+    def _items_for(self, inspect, cam_id):
+        items = []
+        for item in self.judgment.get("defects") or []:
+            if item.get("inspect") != inspect or int(item.get("cam_id", 0)) != cam_id:
+                continue
+            items.append(item)
+        return items
 
     def _defects_for(self, inspect, cam_id):
-        return [
-            item.get("bbox")
-            for item in self.judgment.get("defects") or []
-            if item.get("inspect") == inspect and int(item.get("cam_id", 0)) == cam_id
-        ]
+        return merge_unsup_yolo_boxes(self._items_for(inspect, cam_id), use_crop=self._crop_enabled())
 
-    def _refresh_all_cells(self, highlight=None):
+    def _refresh_all_cells(self, highlight=None, only_inspect=None, only_keys=None):
+        if highlight is None:
+            highlight = self._highlight
+        inspect_filter = set(only_inspect) if only_inspect else None
+        key_filter = set(only_keys) if only_keys else None
         for (inspect, cam_id), cell in self.cells.items():
+            if inspect_filter is not None and inspect not in inspect_filter:
+                continue
+            if key_filter is not None and (inspect, cam_id) not in key_filter:
+                continue
             manifest = self.manifests.get(inspect)
             path = None
             if manifest:
@@ -1986,51 +2428,77 @@ class InspectWall(Frame):
                 if h_inspect == inspect and h_cam == cam_id:
                     highlight_idx = h_idx
             key = (inspect, cam_id)
+            try:
+                mtime = Path(path).stat().st_mtime_ns if path and Path(path).is_file() else 0
+            except OSError:
+                mtime = 0
+            sig = (
+                str(path or ""),
+                mtime,
+                tuple(tuple(b) if b else None for b in bboxes),
+                highlight_idx,
+                tuple(self.cell_size),
+                self._crop_enabled(),
+            )
+            if self._cell_sig.get(key) == sig and key in self.photos:
+                continue
             if path and Path(path).is_file():
                 try:
                     photo = render_image(
-                        path, bboxes, highlight_idx, self.cell_size, cam_id=cam_id, inspect=inspect,
+                        path,
+                        bboxes,
+                        highlight_idx,
+                        self.cell_size,
+                        cam_id=cam_id,
+                        inspect=inspect,
+                        crop=self._crop_enabled(),
                     )
                     self.photos[key] = photo
+                    self._cell_sig[key] = sig
                     cell.config(image=photo, text="", compound="center")
                 except OSError:
+                    self._cell_sig.pop(key, None)
                     cell.config(image="", text="—")
             else:
+                self._cell_sig.pop(key, None)
                 cell.config(image="", text="—")
 
     def highlight_defect(self, defect_index):
         defects = self.judgment.get("defects") or []
         if defect_index < 0 or defect_index >= len(defects):
-            self._refresh_all_cells()
+            prev = self._highlight
+            self._highlight = None
+            if prev:
+                self._refresh_all_cells(highlight=None, only_keys={(prev[0], prev[1])})
+            else:
+                self._refresh_all_cells()
             return
         self.highlight_item(defects[defect_index])
 
     def highlight_item(self, item):
         if not item:
-            self._refresh_all_cells()
+            prev = self._highlight
+            self._highlight = None
+            if prev:
+                self._refresh_all_cells(highlight=None, only_keys={(prev[0], prev[1])})
+            else:
+                self._refresh_all_cells()
             return
         cam_id = int(item.get("cam_id", 0))
         inspect = item.get("inspect", "")
-        target = _bbox_key(item.get("bbox"))
-        defects = self.judgment.get("defects") or []
-        local_idx = -1
-        fallback = -1
-        count = 0
-        for defect in defects:
-            if defect.get("inspect") != inspect or int(defect.get("cam_id", 0)) != cam_id:
-                continue
-            if fallback < 0:
-                fallback = count
-            if target and _bbox_key(defect.get("bbox")) == target:
-                local_idx = count
-                break
-            count += 1
-        if local_idx < 0:
-            local_idx = fallback
+        use_crop = self._crop_enabled()
+        target = item.get("crop_bbox") if use_crop else item.get("bbox")
+        merged = self._defects_for(inspect, cam_id)
+        local_idx = overlay_highlight_index(merged, target)
         if local_idx < 0:
             self._refresh_all_cells()
             return
-        self._refresh_all_cells(highlight=(inspect, cam_id, local_idx))
+        prev = self._highlight
+        self._highlight = (inspect, cam_id, local_idx)
+        keys = {(inspect, cam_id)}
+        if prev:
+            keys.add((prev[0], prev[1]))
+        self._refresh_all_cells(highlight=self._highlight, only_keys=keys)
 
 
 class DefectPanel(Frame):

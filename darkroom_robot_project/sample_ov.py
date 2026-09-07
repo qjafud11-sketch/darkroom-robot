@@ -1,10 +1,11 @@
 """Geti OpenVINO 샘플 면 분할.
 
-Geti에서 보낸 lite_hrnet_s (의미 분할). 입력 512×512, 출력 3채널
+Geti SegNext-small (의미 분할). 입력 512×512, 출력 3채널
 softmax — 0 배경, 1 sample-detection, 2 Empty.
 
   ~/darkroom_models/openvino/sample_seg/model.xml
   없으면 ~/Downloads/OpenVINO_model/model.xml
+  브라우저 재다운로드명 OpenVINO_model(1).zip 도 같은 폴더에서 찾는다.
 """
 from __future__ import annotations
 
@@ -16,6 +17,20 @@ import numpy as np
 
 DEFAULT_XML = Path.home() / "darkroom_models" / "openvino" / "sample_seg" / "model.xml"
 DOWNLOAD_XML = Path.home() / "Downloads" / "OpenVINO_model" / "model.xml"
+DOWNLOAD_XML_ALT = Path.home() / "Downloads" / "OpenVINO_model(1)" / "model.xml"
+
+
+def _xml_candidates():
+    yield DEFAULT_XML
+    yield DOWNLOAD_XML
+    yield DOWNLOAD_XML_ALT
+    downloads = Path.home() / "Downloads"
+    if downloads.is_dir():
+        for folder in sorted(downloads.glob("OpenVINO_model*")):
+            if folder.is_dir():
+                yield folder / "model.xml"
+
+
 IMGSZ = 512
 MEAN = np.array([123.675, 116.28, 103.53], dtype=np.float32)
 SCALE = np.array([58.395, 57.12, 57.375], dtype=np.float32)
@@ -30,9 +45,10 @@ def weights_path() -> Path:
     raw = os.environ.get("SAMPLE_OV_PATH", "").strip()
     if raw:
         return Path(raw).expanduser()
-    if DEFAULT_XML.is_file():
-        return DEFAULT_XML
-    return DOWNLOAD_XML
+    for path in _xml_candidates():
+        if path.is_file() and path.with_suffix(".bin").is_file():
+            return path
+    return DEFAULT_XML
 
 
 def available() -> bool:
@@ -112,10 +128,10 @@ def predict_mask(image: Image.Image | np.ndarray | str | Path, conf: float = SOF
     out = compiled(x)[compiled.output(0)]
     if out.ndim != 4 or out.shape[1] < 2:
         return None
-    prob = out[0, SAMPLE_CH]
-    mask = Image.fromarray((prob > float(conf)).astype(np.uint8) * 255, mode="L")
-    mask = mask.resize((w, h), Image.NEAREST)
-    raw = np.asarray(mask) > 127
+    prob = np.clip(out[0, SAMPLE_CH], 0.0, 1.0)
+    mask = Image.fromarray((prob * 255.0).astype(np.uint8), mode="L")
+    mask = mask.resize((w, h), Image.BILINEAR)
+    raw = np.asarray(mask) >= int(round(float(conf) * 255))
     return raw if raw.any() else None
 
 

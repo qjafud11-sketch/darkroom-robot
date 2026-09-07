@@ -9,7 +9,7 @@ from typing import Any
 
 from PIL import Image, ImageDraw, ImageFont
 
-from ui_store import format_judged_at, list_records
+from ui_store import format_judged_at, list_report_records, report_day
 
 # 다크 테마 (gui_common COLORS 와 맞춤)
 _C = {
@@ -191,7 +191,10 @@ def yield_trend(records: list[dict[str, Any]], period: str = "day") -> tuple[lis
         dt = _parse_dt(rec.get("judged_at", ""))
         if not dt:
             continue
-        if period == "week":
+        if period == "hour":
+            key = dt.strftime("%Y-%m-%d-%H")
+            label = dt.strftime("%H시")
+        elif period == "week":
             key = dt.strftime("%Y-W%W")
             label = f"{dt.month}/{dt.day}주"
         elif period == "month":
@@ -220,7 +223,10 @@ def yield_trend(records: list[dict[str, Any]], period: str = "day") -> tuple[lis
         dt = _parse_dt(rec.get("judged_at", ""))
         if not dt:
             continue
-        if period == "week":
+        if period == "hour":
+            k = dt.strftime("%Y-%m-%d-%H")
+            seen[k] = dt.strftime("%H시")
+        elif period == "week":
             k = dt.strftime("%Y-W%W")
             seen[k] = f"{dt.month}/{dt.day}주"
         elif period == "month":
@@ -473,15 +479,19 @@ def render_spc_r(groups: list[dict[str, float]], size=(560, 300)) -> Image.Image
     return img
 
 
-def build_report_bundle(period: str = "day") -> dict[str, Any]:
-    records = list_records()
-    labels, rates, _ = yield_trend(records, period)
+def build_report_bundle(period: str = "hour", day: str | None = None) -> dict[str, Any]:
+    day = day or report_day()
+    records = list_report_records(day)
+    chart_period = period if period in ("hour", "day", "week", "month") else "hour"
+    if chart_period in ("week", "month"):
+        chart_period = "hour"
+    labels, rates, _ = yield_trend(records, chart_period)
     slices = defect_type_breakdown(records)
     groups = spc_subgroups(records)
-    period_ko = {"day": "일별", "week": "주별", "month": "월별"}.get(period, period)
     return {
+        "day": day,
         "records": records,
-        "yield_chart": render_yield_chart(labels, rates, period_ko),
+        "yield_chart": render_yield_chart(labels, rates, f"{day} · 시간대"),
         "pie_chart": render_pie_chart(slices),
         "xbar_chart": render_spc_xbar(groups),
         "r_chart": render_spc_r(groups),

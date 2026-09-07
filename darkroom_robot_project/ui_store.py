@@ -14,20 +14,33 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from judgment import image_path_from_cam, load_manifest
+from judgment import image_path_from_cam, load_manifest, merge_unsup_yolo_boxes
 
 RECORDS_ROOT = Path.home() / "darkroom_records"
 HISTORY_PATH = Path.home() / "darkroom_inspection_history.json"
+STATS_DIR = Path.home() / "darkroom_report_stats"
+STATS_PATH = STATS_DIR
+LABELED_ROOT = Path.home() / "darkroom_labeled"
+LEGACY_STATS_PATH = Path.home() / "darkroom_report_stats.jsonl"
 SETTINGS_PATH = Path.home() / "darkroom_ui_settings.json"
 
 DEFAULT_SETTINGS = {
-    "judge_backend": "stub",
-    "judge_score_min": "0.25",
+    "judge_backend": "unsup",
+    "judge_score_min": "0.60",
     "judge_model_path": "",
     "history_max": "200",
 }
 
 PREVIEW_SIZE = (360, 200)
+LABELED_SIZE = (640, 360)
+_LABELED_FACES = (
+    ("1차", 1, "면1"),
+    ("1차", 2, "면2"),
+    ("1차", 3, "면3"),
+    ("1차", 4, "면4"),
+    ("2차", 3, "면5"),
+    ("2차", 4, "면6"),
+)
 
 
 def _load_json(path: Path, default: dict) -> dict:
@@ -49,12 +62,6 @@ def load_settings() -> dict[str, str]:
     saved = _load_json(SETTINGS_PATH, DEFAULT_SETTINGS)
     out = dict(DEFAULT_SETTINGS)
     out.update({k: str(v) for k, v in saved.items() if k in DEFAULT_SETTINGS})
-    if os.environ.get("JUDGE_BACKEND"):
-        out["judge_backend"] = os.environ["JUDGE_BACKEND"]
-    if os.environ.get("JUDGE_SCORE_MIN"):
-        out["judge_score_min"] = os.environ["JUDGE_SCORE_MIN"]
-    if os.environ.get("JUDGE_MODEL_PATH"):
-        out["judge_model_path"] = os.environ["JUDGE_MODEL_PATH"]
     return out
 
 
@@ -67,7 +74,7 @@ def save_settings(values: dict[str, str]):
 def settings_env_snippet(values: dict[str, str]) -> str:
     lines = [
         f"export JUDGE_BACKEND={values.get('judge_backend', 'unsup')}",
-        f"export JUDGE_SCORE_MIN={values.get('judge_score_min', '0.25')}",
+        f"export JUDGE_SCORE_MIN={values.get('judge_score_min', '0.60')}",
     ]
     model = values.get("judge_model_path", "").strip()
     if model:
@@ -76,15 +83,15 @@ def settings_env_snippet(values: dict[str, str]) -> str:
 
 
 def apply_settings_to_env() -> dict[str, str]:
-    """실행기 시작 시 설정 파일을 환경 변수로 넣는다. 이미 있는 env 는 유지."""
+    """실행기 시작 시 설정 파일을 환경 변수로 넣는다."""
     if not SETTINGS_PATH.is_file():
         save_settings(DEFAULT_SETTINGS)
     values = load_settings()
-    os.environ.setdefault("JUDGE_BACKEND", values.get("judge_backend") or "stub")
-    os.environ.setdefault("JUDGE_SCORE_MIN", values.get("judge_score_min") or "0.25")
+    os.environ["JUDGE_BACKEND"] = values.get("judge_backend") or "unsup"
+    os.environ["JUDGE_SCORE_MIN"] = values.get("judge_score_min") or "0.60"
     model = (values.get("judge_model_path") or "").strip()
     if model:
-        os.environ.setdefault("JUDGE_MODEL_PATH", model)
+        os.environ["JUDGE_MODEL_PATH"] = model
     return values
 
 
@@ -181,7 +188,8 @@ def _copy_inspect_folder(src_folder: str, dest: Path, label: str) -> str:
     return str(dest)
 
 
-def _pick_preview_source(judgment: dict[str, Any]) -> tuple[str, list[list[int]]]:
+def preview_source_and_boxes(judgment: dict[str, Any]) -> tuple[str, list[list[int]], int, str]:
+    """전체 화면 미리보기용 촬영본과 bbox. 크롭 좌표는 쓰지 않는다."""
     defects = judgment.get("defects") or []
     if defects:
         item = defects[0]
@@ -189,32 +197,38 @@ def _pick_preview_source(judgment: dict[str, Any]) -> tuple[str, list[list[int]]
         inspect = item.get("inspect", "1차")
         folder = judgment.get("manifest_1") if inspect == "1차" else judgment.get("manifest_2")
         manifest = load_manifest(folder or "")
-        bboxes = [
-            d.get("bbox")
+        face_items = [
+            d
             for d in defects
             if d.get("inspect") == inspect and int(d.get("cam_id", 0)) == cam_id
         ]
+        bboxes = merge_unsup_yolo_boxes(face_items, use_crop=False)
         if manifest:
             for cam in manifest.get("cameras") or []:
                 path = image_path_from_cam(cam)
                 if int(cam.get("id", 0)) == cam_id and path:
-                    return path, [b for b in bboxes if b]
-    for folder_key in ("manifest_1", "manifest_2"):
+                    return path, bboxes, cam_id, inspect
+    inspect = "1차"
+    for folder_key, label in (("manifest_1", "1차"), ("manifest_2", "2차")):
         manifest = load_manifest(judgment.get(folder_key) or "")
         if not manifest:
             continue
         for cam in manifest.get("cameras") or []:
             path = image_path_from_cam(cam)
             if path:
-                return str(path), []
-    return "", []
+                return str(path), [], int(cam.get("id", 0) or 0), label
+    return "", [], 0, "1차"
+
+
+def _pick_preview_source(judgment: dict[str, Any]) -> tuple[str, list[list[int]], int, str]:
+    return preview_source_and_boxes(judgment)
 
 
 def _make_preview(archive: Path, judgment: dict[str, Any]) -> Path:
     from PIL import Image, ImageDraw
 
     preview_path = archive / "preview.jpg"
-    src, bboxes = _pick_preview_source(judgment)
+    src, bboxes, cam_id, inspect = _pick_preview_source(judgment)
     if not src or not Path(src).is_file():
         img = Image.new("RGB", PREVIEW_SIZE, color=(15, 22, 40))
         draw = ImageDraw.Draw(img)
@@ -222,13 +236,19 @@ def _make_preview(archive: Path, judgment: dict[str, Any]) -> Path:
         img.save(preview_path, quality=85)
         return preview_path
 
-    img = Image.open(src).convert("RGB")
+    if cam_id:
+        from camera_calib import inspect_stage, open_camera_rgb
+
+        img = open_camera_rgb(src, int(cam_id), stage=inspect_stage(inspect))
+    else:
+        img = Image.open(src).convert("RGB")
+    overlay = list(bboxes)
     orig_w, orig_h = img.size
-    img.thumbnail(PREVIEW_SIZE)
-    if bboxes and orig_w > 0 and orig_h > 0:
+    img.thumbnail(PREVIEW_SIZE, Image.BILINEAR)
+    if overlay and orig_w > 0 and orig_h > 0:
         sx, sy = img.size[0] / orig_w, img.size[1] / orig_h
         draw = ImageDraw.Draw(img)
-        for idx, bbox in enumerate(bboxes):
+        for bbox in overlay:
             if not bbox or len(bbox) < 4:
                 continue
             x1, y1, x2, y2 = bbox[:4]
@@ -247,6 +267,316 @@ def load_record_from_archive(archive_path: str | Path) -> dict[str, Any] | None:
         return json.loads(record_file.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
+
+
+def _compact_record(record: dict[str, Any]) -> dict[str, Any]:
+    """리포트용 최소 수치. 사진·전체 판정 JSON은 넣지 않는다."""
+    judgment = record.get("judgment") or {}
+    defects = []
+    for item in judgment.get("defects") or []:
+        score = item.get("score")
+        try:
+            score = round(float(score), 4) if score is not None else None
+        except (TypeError, ValueError):
+            score = None
+        defects.append(
+            {
+                "class_name": str(item.get("class_name") or ""),
+                "score": score,
+                "cam_id": item.get("cam_id"),
+                "inspect": item.get("inspect"),
+            }
+        )
+    return {
+        "id": record.get("id"),
+        "run_no": record.get("run_no"),
+        "verdict": record.get("verdict"),
+        "judged_at": record.get("judged_at"),
+        "backend": record.get("backend", ""),
+        "defect_count": int(record.get("defect_count") or len(defects)),
+        "message": record.get("message") or "",
+        "preview": record.get("preview") or "",
+        "labeled_dir": record.get("labeled_dir") or "",
+        "faces": list(record.get("faces") or []),
+        "judgment": {"verdict": record.get("verdict"), "defects": defects},
+    }
+
+
+def report_day(judged_at: str | None = None) -> str:
+    """리포트 파일 날짜. 비우면 오늘(로컬)."""
+    dt = _parse_time(judged_at) if judged_at else datetime.now()
+    return dt.strftime("%Y-%m-%d")
+
+
+def stats_path_for_day(day: str | None = None) -> Path:
+    return STATS_DIR / f"{day or report_day()}.jsonl"
+
+
+def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+    if not path.is_file():
+        return []
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    rows: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(item, dict):
+            rows.append(item)
+    return rows
+
+
+def _migrate_legacy_stats():
+    """예전 단일 jsonl 을 날짜별 파일로 나눈다. 한 번만."""
+    if not LEGACY_STATS_PATH.is_file():
+        return
+    STATS_DIR.mkdir(parents=True, exist_ok=True)
+    by_day: dict[str, list[str]] = {}
+    for rec in _read_jsonl(LEGACY_STATS_PATH):
+        day = report_day(rec.get("judged_at"))
+        line = json.dumps(_compact_record(rec), ensure_ascii=False, separators=(",", ":"))
+        by_day.setdefault(day, []).append(line)
+    for day, lines in by_day.items():
+        dest = stats_path_for_day(day)
+        with dest.open("a", encoding="utf-8") as fh:
+            fh.write("\n".join(lines))
+            fh.write("\n")
+    bak = LEGACY_STATS_PATH.with_name(LEGACY_STATS_PATH.name + ".bak")
+    try:
+        LEGACY_STATS_PATH.replace(bak)
+    except OSError:
+        pass
+
+
+def list_report_days() -> list[str]:
+    _migrate_legacy_stats()
+    days = set()
+    if STATS_DIR.is_dir():
+        for path in STATS_DIR.glob("????-??-??.jsonl"):
+            try:
+                if path.stat().st_size > 0:
+                    days.add(path.stem)
+            except OSError:
+                continue
+    days.add(report_day())
+    return sorted(days)
+
+
+def _stats_ids() -> set:
+    _migrate_legacy_stats()
+    ids = set()
+    if not STATS_DIR.is_dir():
+        return ids
+    for path in STATS_DIR.glob("*.jsonl"):
+        for row in _read_jsonl(path):
+            rec_id = row.get("id")
+            if rec_id is not None:
+                ids.add(rec_id)
+    return ids
+
+
+def append_stats_row(record: dict[str, Any]):
+    _migrate_legacy_stats()
+    STATS_DIR.mkdir(parents=True, exist_ok=True)
+    dest = stats_path_for_day(report_day(record.get("judged_at")))
+    line = json.dumps(_compact_record(record), ensure_ascii=False, separators=(",", ":"))
+    with dest.open("a", encoding="utf-8") as fh:
+        fh.write(line)
+        fh.write("\n")
+
+
+def list_stats_records(day: str | None = None) -> list[dict[str, Any]]:
+    _migrate_legacy_stats()
+    return _read_jsonl(stats_path_for_day(day or report_day()))
+
+
+def list_report_records(day: str | None = None) -> list[dict[str, Any]]:
+    """지정한 날의 리포트. 기본은 오늘. 세션 폴더가 있으면 미리보기 있는 쪽을 쓴다."""
+    day = day or report_day()
+    by_id: dict[Any, dict[str, Any]] = {}
+    for rec in list_stats_records(day):
+        rec_id = rec.get("id")
+        if rec_id is not None:
+            by_id[rec_id] = rec
+        else:
+            by_id[id(rec)] = rec
+    for rec in list_records():
+        if report_day(rec.get("judged_at")) != day:
+            continue
+        rec_id = rec.get("id")
+        if rec_id is not None:
+            by_id[rec_id] = rec
+        else:
+            by_id[id(rec)] = rec
+    for rec in list_labeled_records(day):
+        rec_id = rec.get("id")
+        if rec_id is not None:
+            by_id[rec_id] = rec
+        else:
+            by_id[id(rec)] = rec
+    records = list(by_id.values())
+    records.sort(key=lambda r: r.get("judged_at", ""), reverse=True)
+    return records
+
+
+def labeled_dir_for(record: dict[str, Any]) -> Path:
+    day = report_day(record.get("judged_at"))
+    rec_id = record.get("id") or "x"
+    verdict = record.get("verdict") or "UNK"
+    return LABELED_ROOT / day / f"{rec_id}_{verdict}"
+
+
+def _face_source_path(record: dict[str, Any], inspect: str, cam_id: int) -> str:
+    judgment = record.get("judgment") or {}
+    folder = judgment.get("manifest_1") if inspect == "1차" else judgment.get("manifest_2")
+    manifest = load_manifest(folder or "")
+    if not manifest:
+        return ""
+    for cam in manifest.get("cameras") or []:
+        if int(cam.get("id", 0)) == int(cam_id):
+            return image_path_from_cam(cam) or ""
+    return ""
+
+
+def _draw_boxes(img, bboxes, orig_size):
+    if not bboxes:
+        return
+    orig_w, orig_h = orig_size
+    w, h = img.size
+    if orig_w <= 0 or orig_h <= 0:
+        return
+    sx, sy = w / orig_w, h / orig_h
+    from PIL import ImageDraw
+
+    draw = ImageDraw.Draw(img)
+    for bbox in bboxes:
+        if not bbox or len(bbox) < 4:
+            continue
+        x1, y1, x2, y2 = bbox[:4]
+        draw.rectangle([x1 * sx, y1 * sy, x2 * sx, y2 * sy], outline="#EF4444", width=3)
+
+
+def save_labeled_archive(record: dict[str, Any]) -> dict[str, Any]:
+    """원본 6장을 결함 박스가 그려진 JPEG로 줄여 보관한다."""
+    from PIL import Image
+
+    dest = labeled_dir_for(record)
+    dest.mkdir(parents=True, exist_ok=True)
+    judgment = record.get("judgment") or {}
+    defects = judgment.get("defects") or []
+    faces = []
+    preview_src = ""
+    for inspect, cam_id, name in _LABELED_FACES:
+        src = _face_source_path(record, inspect, cam_id)
+        if not src or not Path(src).is_file():
+            continue
+        boxes = [
+            item.get("bbox")
+            for item in defects
+            if item.get("inspect") == inspect and int(item.get("cam_id", 0)) == cam_id and item.get("bbox")
+        ]
+        img = Image.open(src).convert("RGB")
+        orig = img.size
+        img.thumbnail(LABELED_SIZE, Image.BILINEAR)
+        _draw_boxes(img, boxes, orig)
+        out = dest / f"{inspect}_cam{cam_id}.jpg"
+        img.save(out, quality=82, optimize=True)
+        faces.append(
+            {
+                "inspect": inspect,
+                "cam_id": cam_id,
+                "name": name,
+                "file": str(out),
+            }
+        )
+        if boxes and not preview_src:
+            preview_src = str(out)
+        elif not preview_src:
+            preview_src = str(out)
+    preview = dest / "preview.jpg"
+    if preview_src and Path(preview_src).is_file():
+        if Path(preview_src).resolve() != preview.resolve():
+            shutil.copy2(preview_src, preview)
+        else:
+            preview = Path(preview_src)
+    compact = _compact_record(record)
+    compact["preview"] = str(preview) if preview.is_file() else ""
+    compact["labeled_dir"] = str(dest)
+    compact["faces"] = faces
+    compact["judgment"] = {
+        "verdict": record.get("verdict"),
+        "defects": compact["judgment"]["defects"],
+        "backend": record.get("backend", ""),
+        "message": record.get("message", ""),
+    }
+    (dest / "meta.json").write_text(
+        json.dumps(compact, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return compact
+
+
+def list_labeled_days() -> list[str]:
+    days = []
+    if not LABELED_ROOT.is_dir():
+        return days
+    for path in sorted(LABELED_ROOT.iterdir()):
+        if path.is_dir() and any(path.glob("*/meta.json")):
+            days.append(path.name)
+    return days
+
+
+def list_labeled_records(day: str | None = None) -> list[dict[str, Any]]:
+    day = day or report_day()
+    folder = LABELED_ROOT / day
+    records: list[dict[str, Any]] = []
+    if not folder.is_dir():
+        return records
+    for item in folder.iterdir():
+        meta = item / "meta.json" if item.is_dir() else None
+        if not meta or not meta.is_file():
+            continue
+        try:
+            rec = json.loads(meta.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(rec, dict):
+            records.append(rec)
+    records.sort(key=lambda r: r.get("judged_at", ""), reverse=True)
+    return records
+
+
+def purge_record_files():
+    """촬영 폴더만 지운다. 리포트 jsonl·next_id 는 유지."""
+    if not RECORDS_ROOT.is_dir():
+        return
+    for folder in RECORDS_ROOT.iterdir():
+        if folder.is_dir():
+            shutil.rmtree(folder, ignore_errors=True)
+
+
+def flush_archives_to_stats():
+    """종료 시 결함 박스 JPEG만 남기고 원본 기록 폴더는 지운다."""
+    known = _stats_ids()
+    for rec in list_records():
+        try:
+            packed = save_labeled_archive(rec)
+        except Exception as exc:
+            print(f"[기록] 라벨 보관 실패 id={rec.get('id')}: {exc}")
+            packed = rec
+        rec_id = packed.get("id")
+        if rec_id not in known:
+            append_stats_row(packed)
+            if rec_id is not None:
+                known.add(rec_id)
+    purge_record_files()
 
 
 def list_records() -> list[dict[str, Any]]:
@@ -302,18 +632,217 @@ def append_record(judgment: dict[str, Any], run_no: int) -> dict[str, Any]:
 def _trim_old_records():
     records = list_records()
     limit = _history_max()
+    known = _stats_ids()
     for rec in records[limit:]:
+        rec_id = rec.get("id")
+        try:
+            packed = save_labeled_archive(rec)
+        except Exception:
+            packed = rec
+        if rec_id not in known:
+            append_stats_row(packed)
+            if rec_id is not None:
+                known.add(rec_id)
         path = rec.get("archive_path")
         if path and Path(path).is_dir():
             shutil.rmtree(path, ignore_errors=True)
 
 
 def clear_history():
-    if RECORDS_ROOT.is_dir():
-        for folder in RECORDS_ROOT.iterdir():
-            if folder.is_dir():
-                shutil.rmtree(folder, ignore_errors=True)
-    _save_json(HISTORY_PATH, {"next_id": 1})
+    """이번 세션 이미지 폴더만 지운다. 리포트 누적 수치는 유지."""
+    purge_record_files()
+
+
+def delete_records(record_ids) -> int:
+    """선택한 기록 폴더만 지운다. 지운 개수를 반환."""
+    wanted = {int(x) for x in record_ids}
+    removed = 0
+    for rec in list_records():
+        try:
+            rec_id = int(rec.get("id"))
+        except (TypeError, ValueError):
+            continue
+        if rec_id not in wanted:
+            continue
+        path = rec.get("archive_path")
+        if path and Path(path).is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+            removed += 1
+    return removed
+
+
+def _xlsx_cell(value: Any) -> str:
+    from xml.sax.saxutils import escape
+
+    if value is None:
+        return '<c/>'
+    if isinstance(value, bool):
+        return f'<c t="b"><v>{1 if value else 0}</v></c>'
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return f'<c><v>{value}</v></c>'
+    text = escape(str(value))
+    return f'<c t="inlineStr"><is><t>{text}</t></is></c>'
+
+
+def write_xlsx(path: str | Path, sheets: dict[str, list[list[Any]]]) -> Path:
+    """openpyxl 없이 최소 xlsx를 만든다."""
+    import zipfile
+
+    dest = Path(path).expanduser()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    names = list(sheets.keys()) or ["Sheet1"]
+    workbook_sheets = []
+    sheet_files = {}
+    for idx, name in enumerate(names, start=1):
+        rows = sheets.get(name) or []
+        xml_rows = []
+        for r_i, row in enumerate(rows, start=1):
+            cells = "".join(_xlsx_cell(col) for col in row)
+            xml_rows.append(f'<row r="{r_i}">{cells}</row>')
+        sheet_files[f"xl/worksheets/sheet{idx}.xml"] = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            f'<sheetData>{"".join(xml_rows)}</sheetData></worksheet>'
+        )
+        safe = name.replace("&", "")[:31] or f"Sheet{idx}"
+        workbook_sheets.append(
+            f'<sheet name="{safe}" sheetId="{idx}" r:id="rId{idx}"/>'
+        )
+    content_types = [
+        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>',
+        '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>',
+    ]
+    rels = []
+    for idx in range(1, len(names) + 1):
+        content_types.append(
+            f'<Override PartName="/xl/worksheets/sheet{idx}.xml" '
+            'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        )
+        rels.append(
+            f'<Relationship Id="rId{idx}" '
+            'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
+            f'Target="worksheets/sheet{idx}.xml"/>'
+        )
+    files = {
+        "[Content_Types].xml": (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+            '<Default Extension="xml" ContentType="application/xml"/>'
+            + "".join(content_types)
+            + "</Types>"
+        ),
+        "_rels/.rels": (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+            "</Relationships>"
+        ),
+        "xl/workbook.xml": (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+            'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+            f'<sheets>{"".join(workbook_sheets)}</sheets></workbook>'
+        ),
+        "xl/_rels/workbook.xml.rels": (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            + "".join(rels)
+            + "</Relationships>"
+        ),
+        "xl/styles.xml": (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            "<fonts count=\"1\"><font><sz val=\"11\"/><name val=\"Calibri\"/></font></fonts>"
+            "<fills count=\"1\"><fill><patternFill patternType=\"none\"/></fill></fills>"
+            "<borders count=\"1\"><border/></borders>"
+            "<cellStyleXfs count=\"1\"><xf/></cellStyleXfs>"
+            "<cellXfs count=\"1\"><xf/></cellXfs>"
+            "</styleSheet>"
+        ),
+        **sheet_files,
+    }
+    with zipfile.ZipFile(dest, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for name, payload in files.items():
+            zf.writestr(name, payload.encode("utf-8"))
+    return dest
+
+
+_FACE_EXPORT = {
+    ("1차", 1): "면1",
+    ("1차", 2): "면2",
+    ("1차", 3): "면3",
+    ("1차", 4): "면4",
+    ("2차", 3): "면5",
+    ("2차", 4): "면6",
+}
+
+
+def export_ng_xlsx(path: str | Path, records: list[dict[str, Any]] | None = None) -> Path:
+    """NG 기록과 결함 목록을 엑셀로 보낸다."""
+    from reports_analytics import defect_label
+
+    rows = records if records is not None else list_report_records()
+    ng_rows = [r for r in rows if str(r.get("verdict", "")).upper() == "NG"]
+    summary = [
+        ["기록ID", "시각", "Run", "폴더", "결함수", "유형", "백엔드", "메시지", "경로"],
+    ]
+    detail = [
+        ["기록ID", "시각", "Run", "면", "검사", "카메라", "유형", "점수", "문턱", "x1", "y1", "x2", "y2", "크롭x1", "크롭y1", "크롭x2", "크롭y2", "메시지"],
+    ]
+    for rec in ng_rows:
+        judgment = rec.get("judgment") or {}
+        defects = judgment.get("defects") or []
+        types = ", ".join(
+            defect_label(str(d.get("class_name", ""))) for d in defects
+        ) or "—"
+        rec_id = rec.get("id", "")
+        judged = rec.get("judged_at", "")
+        run_no = rec.get("run_no", "")
+        folder = Path(rec.get("archive_path", "")).name
+        summary.append([
+            rec_id,
+            judged,
+            run_no,
+            folder,
+            len(defects),
+            types,
+            rec.get("backend", ""),
+            rec.get("message", ""),
+            rec.get("archive_path", ""),
+        ])
+        if not defects:
+            detail.append([
+                rec_id, judged, run_no, "", "", "", "검출 없음", "", "", "", "", "", "", "", "", "", "", rec.get("message", ""),
+            ])
+            continue
+        for defect in defects:
+            inspect = str(defect.get("inspect", ""))
+            cam_id = int(defect.get("cam_id") or 0)
+            bbox = defect.get("bbox") or [None, None, None, None]
+            crop = defect.get("crop_bbox") or [None, None, None, None]
+            bbox = list(bbox) + [None] * 4
+            crop = list(crop) + [None] * 4
+            score = defect.get("score")
+            threshold = defect.get("threshold")
+            detail.append([
+                rec_id,
+                judged,
+                run_no,
+                _FACE_EXPORT.get((inspect, cam_id), ""),
+                inspect,
+                cam_id,
+                defect_label(str(defect.get("class_name", ""))),
+                round(float(score), 4) if score is not None else "",
+                round(float(threshold), 4) if threshold not in (None, "") else "",
+                bbox[0], bbox[1], bbox[2], bbox[3],
+                crop[0], crop[1], crop[2], crop[3],
+                rec.get("message", ""),
+            ])
+    return write_xlsx(
+        path,
+        {"NG기록": summary, "결함상세": detail},
+    )
 
 
 def history_summary(records: list[dict[str, Any]]) -> dict[str, Any]:

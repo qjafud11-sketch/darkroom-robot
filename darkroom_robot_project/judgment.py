@@ -4,8 +4,9 @@
 
 환경 변수:
   JUDGE_BACKEND   unsup(기본, 비지도+YOLO) | yolo | both | stub | mock | model
-  JUDGE_MODEL_PATH   YOLO 가중치. 비우면 ~/darkroom_models/yolo/crop640/weights/best.pt
-  JUDGE_SCORE_MIN    YOLO NG confidence (기본 0.25). 비지도는 면별 threshold.json
+  JUDGE_MODEL_PATH   결함 모델. 비우면 ~/darkroom_models/openvino/defect_det/model.xml
+                     (없으면 yolo/crop640/weights/best.pt)
+  JUDGE_SCORE_MIN    YOLO NG confidence (기본 0.60). 비지도는 면별 threshold.json
   JUDGE_MOCK_NG      mock 백엔드에서 1이면 테스트 NG
 """
 from __future__ import annotations
@@ -28,8 +29,9 @@ class Defect:
     inspect: str  # "1차" | "2차"
     class_name: str
     score: float
-    bbox: list[int]  # [x1, y1, x2, y2] — 1280×720 기준
+    bbox: list[int]  # [x1, y1, x2, y2] — 촬영 프레임 기준
     threshold: float = 0.0
+    crop_bbox: list[int] = field(default_factory=list)  # 샘플 면 크롭 좌표
 
     def to_dict(self):
         return asdict(self)
@@ -50,6 +52,123 @@ class JudgmentResult:
         data = asdict(self)
         data["defects"] = [d.to_dict() if isinstance(d, Defect) else d for d in self.defects]
         return data
+
+
+_YOLO_CLASSES = {"scratch", "dent"}
+_BOX_MERGE_IOU = 0.25
+_BOX_MERGE_IOS = 0.45
+
+
+def _as_box(raw) -> list[float] | None:
+    if not raw or len(raw) < 4:
+        return None
+    x1, y1, x2, y2 = (float(raw[0]), float(raw[1]), float(raw[2]), float(raw[3]))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return [x1, y1, x2, y2]
+
+
+def _defect_source(item: dict[str, Any]) -> str:
+    src = str(item.get("source") or "").strip().lower()
+    if src:
+        return src
+    key = str(item.get("class_name") or "").strip().lower()
+    return "yolo" if key in _YOLO_CLASSES else "unsup"
+
+
+def box_iou(a, b) -> float:
+    aa, bb = _as_box(a), _as_box(b)
+    if not aa or not bb:
+        return 0.0
+    x1, y1 = max(aa[0], bb[0]), max(aa[1], bb[1])
+    x2, y2 = min(aa[2], bb[2]), min(aa[3], bb[3])
+    inter = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    if inter <= 0:
+        return 0.0
+    area_a = (aa[2] - aa[0]) * (aa[3] - aa[1])
+    area_b = (bb[2] - bb[0]) * (bb[3] - bb[1])
+    union = area_a + area_b - inter
+    return inter / union if union else 0.0
+
+
+def box_ios(a, b) -> float:
+    """교집합 / 더 작은 박스. YOLO가 비지도 영역 안에 들어 있는 경우를 잡는다."""
+    aa, bb = _as_box(a), _as_box(b)
+    if not aa or not bb:
+        return 0.0
+    x1, y1 = max(aa[0], bb[0]), max(aa[1], bb[1])
+    x2, y2 = min(aa[2], bb[2]), min(aa[3], bb[3])
+    inter = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    if inter <= 0:
+        return 0.0
+    smaller = min((aa[2] - aa[0]) * (aa[3] - aa[1]), (bb[2] - bb[0]) * (bb[3] - bb[1]))
+    return inter / smaller if smaller else 0.0
+
+
+def boxes_same_region(a, b) -> bool:
+    return box_iou(a, b) >= _BOX_MERGE_IOU or box_ios(a, b) >= _BOX_MERGE_IOS
+
+
+def box_union(a, b) -> list[float]:
+    aa, bb = _as_box(a), _as_box(b)
+    if not aa:
+        return list(bb or [])
+    if not bb:
+        return list(aa)
+    return [min(aa[0], bb[0]), min(aa[1], bb[1]), max(aa[2], bb[2]), max(aa[3], bb[3])]
+
+
+def merge_unsup_yolo_boxes(items: list[dict[str, Any]], *, use_crop: bool = False) -> list[list[int]]:
+    """같은 면의 비지도·YOLO 박스가 같은 영역이면 합집합 하나."""
+    unsup: list[list[float]] = []
+    yolo: list[list[float]] = []
+    other: list[list[float]] = []
+    for item in items:
+        raw = item.get("crop_bbox") if use_crop else item.get("bbox")
+        box = _as_box(raw)
+        if not box:
+            continue
+        src = _defect_source(item)
+        if src == "yolo":
+            yolo.append(box)
+        elif src == "unsup":
+            unsup.append(box)
+        else:
+            other.append(box)
+    used = [False] * len(yolo)
+    out: list[list[int]] = []
+    for u in unsup:
+        acc = list(u)
+        changed = True
+        while changed:
+            changed = False
+            for i, y in enumerate(yolo):
+                if used[i]:
+                    continue
+                if boxes_same_region(acc, y):
+                    acc = box_union(acc, y)
+                    used[i] = True
+                    changed = True
+        out.append([int(round(v)) for v in acc])
+    for i, y in enumerate(yolo):
+        if not used[i]:
+            out.append([int(round(v)) for v in y])
+    out.extend([int(round(v)) for v in box] for box in other)
+    return out
+
+
+def overlay_highlight_index(merged: list[list[int]], target) -> int:
+    if not merged:
+        return -1
+    box = _as_box(target)
+    if not box:
+        return 0
+    best_i, best = 0, -1.0
+    for i, other in enumerate(merged):
+        score = max(box_iou(box, other), box_ios(box, other))
+        if score > best:
+            best, best_i = score, i
+    return best_i
 
 
 def get_last_judgment() -> dict[str, Any] | None:
@@ -95,24 +214,34 @@ def iter_images(manifest: dict[str, Any] | None, inspect_label: str, prefer_ai: 
 
 
 def _score_min() -> float:
-    raw = os.environ.get("JUDGE_SCORE_MIN", "0.25")
+    raw = os.environ.get("JUDGE_SCORE_MIN", "0.60")
     try:
         return float(raw)
     except ValueError:
-        return 0.25
+        return 0.60
 
 
 def _backend_name() -> str:
     env = os.environ.get("JUDGE_BACKEND", "").strip().lower()
-    if env:
+    if env in ("mock", "stub"):
         return env
     try:
-        from ui_store import load_settings
+        from ui_store import SETTINGS_PATH, load_settings
 
-        name = (load_settings().get("judge_backend") or "unsup").strip().lower()
-        return name or "unsup"
+        if SETTINGS_PATH.is_file():
+            name = (load_settings().get("judge_backend") or "").strip().lower()
+            if name:
+                return name
     except Exception:
-        return "unsup"
+        pass
+    if env:
+        return env
+    return "unsup"
+
+
+def _always_ok_face(inspect: str, cam_id: int) -> bool:
+    """면 4 (1차 카메라 4)는 결함 판정에서 뺀다."""
+    return str(inspect).startswith("1") and int(cam_id) == 4
 
 
 def _verdict_from_defects(defects: list[Defect]) -> str:
@@ -247,10 +376,10 @@ def _infer_unsup(manifest_1: dict[str, Any], manifest_2: dict[str, Any]):
                     list(hit["bbox"]),
                     face=key,
                     source="unsup",
-                    extra={"ratio": float(hit.get("ratio") or 0.0)},
+                    extra={"ratio": float(hit.get("ratio") or 0.0), "crop_bbox": list(hit.get("crop_bbox") or [])},
                 )
             )
-            if hit["ng"]:
+            if hit["ng"] and not _always_ok_face(label, cam_id):
                 defects.append(
                     Defect(
                         cam_id=cam_id,
@@ -259,6 +388,7 @@ def _infer_unsup(manifest_1: dict[str, Any], manifest_2: dict[str, Any]):
                         score=float(hit["score"]),
                         bbox=list(hit["bbox"]),
                         threshold=float(hit["threshold"]),
+                        crop_bbox=list(hit.get("crop_bbox") or []),
                     )
                 )
     return defects, scores, missing, errors, tried
@@ -302,8 +432,11 @@ def _infer_yolo(manifest_1: dict[str, Any], manifest_2: dict[str, Any], fill_ok:
                         source="yolo",
                     )
                 )
+            if _always_ok_face(label, cam_id):
+                continue
             for hit in hits:
                 class_name = str(hit.get("class_name") or "unknown")
+                crop_box = list(hit.get("crop_bbox") or [])
                 scores.append(
                     _score_row(
                         cam_id,
@@ -316,6 +449,7 @@ def _infer_yolo(manifest_1: dict[str, Any], manifest_2: dict[str, Any], fill_ok:
                         list(hit["bbox"]),
                         face=key,
                         source="yolo",
+                        extra={"crop_bbox": crop_box},
                     )
                 )
                 defects.append(
@@ -326,6 +460,7 @@ def _infer_yolo(manifest_1: dict[str, Any], manifest_2: dict[str, Any], fill_ok:
                         score=float(hit["score"]),
                         bbox=list(hit["bbox"]),
                         threshold=conf,
+                        crop_bbox=crop_box,
                     )
                 )
     return defects, scores, False, errors, tried
@@ -448,6 +583,13 @@ def infer(manifest_1: dict[str, Any] | None, manifest_2: dict[str, Any] | None) 
         )
         _store(result)
         return result
+
+    try:
+        from sample_roi import archive_operation_crops
+
+        archive_operation_crops(manifest_1, manifest_2)
+    except Exception as exc:
+        print(f"[crop_cum] 저장 실패: {exc}", flush=True)
 
     core = runner(manifest_1, manifest_2)
     core.manifest_1 = name

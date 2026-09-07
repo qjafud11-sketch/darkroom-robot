@@ -93,4 +93,12 @@ if __name__ == "__main__":
         except Exception as exc:
             print(f"[실행기] YOLO 로드 실패: {exc}", flush=True)
     report_ports()
+    if not SKIP_ROBOT_ARM:
+        try:
+            from skills import prepare_arm
+
+            prepare_arm()
+            print("[실행기] 팔 준비 — 불량분류 J1=1050 허용")
+        except Exception as exc:
+            print(f"[실행기] 팔 준비 실패: {exc}", flush=True)
     run_client()

@@ -9,7 +9,12 @@ from pathlib import Path
 import serial
 import time
 
-from hw_ports import EXTRA_CH340_BY_PATH, LIGHT_BY_ID, LIGHT_FALLBACK, resolve_servo_candidates
+from hw_ports import (
+    EXTRA_CH340_BY_PATH,
+    light_candidate_ports,
+    resolve_light_port,
+    resolve_servo_candidates,
+)
 
 BAUD = 9600
 RESET_WAIT = 2.5
@@ -25,10 +30,7 @@ BANNER_WAIT = 3.0
 LIGHT_MAX = 80
 LIGHT_BRIGHTNESS = 80
 
-LIGHT_CANDIDATES = (
-    LIGHT_BY_ID,
-    LIGHT_FALLBACK,
-)
+LIGHT_CANDIDATES = light_candidate_ports
 
 CONSOLE_MARKERS = ("login:", "Debian", "raspberrypi", "ttyAMA")
 
@@ -103,8 +105,8 @@ class ArduinoBoard:
     def _skip_reason(self, leftover):
         if leftover and any(mark in leftover for mark in CONSOLE_MARKERS):
             return "여분 CH340 (서보 아님)"
-        if self.ready_hint and leftover and self.ready_hint not in leftover:
-            return leftover
+        if self.ready_hint and self.ready_hint not in leftover:
+            return leftover or "식별 READY 배너 없음"
         return None
 
     def _get(self):
@@ -197,7 +199,7 @@ _servo = ArduinoBoard("서보", servo_candidate_ports, ready_hint="SERVO")
 def resolve_port():
     """조명 보드 경로. light_test_ui용."""
     ports = _light.resolve_port()
-    return ports[0] if ports else LIGHT_CANDIDATES[-1]
+    return ports[0] if ports else resolve_light_port()
 
 
 def resolve_servo_port():

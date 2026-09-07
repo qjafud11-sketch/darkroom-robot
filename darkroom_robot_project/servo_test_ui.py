@@ -28,7 +28,7 @@ class ServoTestUi:
 
         row = tk.Frame(self.root)
         row.pack(pady=12)
-        tk.Button(row, text="원위치 0°", width=12, height=2, command=lambda: self._go(ANGLE_HOME)).pack(side="left", padx=8)
+        tk.Button(row, text="원위치 8°", width=12, height=2, command=lambda: self._go(ANGLE_HOME)).pack(side="left", padx=8)
         tk.Button(row, text="180°", width=12, height=2, bg="#fde68a", command=lambda: self._go(ANGLE_180)).pack(side="left", padx=8)
 
         custom = tk.Frame(self.root)

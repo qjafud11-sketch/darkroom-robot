@@ -70,7 +70,7 @@ def inspection_first():
 
 
 def inspection_second():
-    """2차 검사: 서보 180° OK → 조명 ON·촬영·OFF OK → 서보 0°.
+    """2차 검사: 서보 180° OK → 조명 ON·촬영·OFF OK → 서보 원위치 8°.
 
     서보 CH340 D8, 조명 FTDI D7. 보드끼리 직접 말하지 않고 PC가 중계한다.
     """
@@ -94,9 +94,9 @@ def inspection_second():
     if LIGHT_DONE_GAP > 0:
         time.sleep(LIGHT_DONE_GAP)
 
-    print("[통신] PC → 서보  0°")
+    print("[통신] PC → 서보  8°")
     servo_home()
-    print("[통신] 서보 → PC  OK 0°")
+    print("[통신] 서보 → PC  OK 8°")
 
 
 def judge_product():

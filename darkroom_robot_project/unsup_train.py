@@ -4,7 +4,7 @@
 출력:  ~/darkroom_models/unsup/<face>/  ckpt + threshold.json
 
 Intel Arc B580 (XPU) 우선, 없으면 CUDA, 없으면 CPU.
-PatchCore 는 에폭 1. 불량 박스가 없어서 문턱은 양품 holdout 최댓값 × 1.10.
+PatchCore 는 에폭 1. 불량 박스가 없어서 문턱은 양품 holdout 최댓값 × 1.80.
 채점은 회색 판 안쪽만 본다 (전선·지그·크롭 테두리 제외).
 
   python unsup_train.py
@@ -27,7 +27,7 @@ MODELS_DIR = Path.home() / "darkroom_models" / "unsup"
 IMAGE_SIZE = (256, 256)
 BACKBONE = "resnet18"
 BATCH = 16
-THRESHOLD_MARGIN = 1.10
+THRESHOLD_MARGIN = 1.80
 
 
 def pick_device():
@@ -58,12 +58,15 @@ def _datamodule(face_key: str):
     from anomalib.data import Folder
     from anomalib.data.utils.split import TestSplitMode, ValSplitMode
 
+    xf = _input_transform()
     return Folder(
         name=face_key,
         root=UNSUP_DIR / face_key,
         normal_dir="train/good",
         normal_test_dir="test/good",
         abnormal_dir=None,
+        task="classification",
+        transform=xf,
         train_batch_size=BATCH,
         eval_batch_size=BATCH,
         num_workers=0,
@@ -76,27 +79,51 @@ def _datamodule(face_key: str):
 def _model():
     from anomalib.models import Patchcore
 
-    pre = Patchcore.configure_pre_processor(image_size=IMAGE_SIZE)
     return Patchcore(
         backbone=BACKBONE,
         layers=("layer2", "layer3"),
         pre_trained=True,
         coreset_sampling_ratio=0.1,
-        pre_processor=pre,
-        evaluator=False,
-        visualizer=False,
     )
 
 
-def _prepare_batch(batch, model, device):
-    transform = getattr(model.pre_processor, "transform", None)
-    if transform is not None:
-        batch.image, batch.gt_mask = transform(batch.image, batch.gt_mask)
-    image = batch.image.to(device, non_blocking=True)
+def _input_transform():
+    from torchvision.transforms.v2 import CenterCrop, Compose, Normalize, Resize
+
+    height, width = IMAGE_SIZE
+    crop = (int(height * (224 / 256)), int(width * (224 / 256)))
+    return Compose(
+        [
+            Resize(IMAGE_SIZE, antialias=True),
+            CenterCrop(crop),
+            Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ]
+    )
+
+
+def _batch_image(batch):
+    if isinstance(batch, dict):
+        return batch["image"]
+    return batch.image
+
+
+def _with_image(batch, image):
+    if isinstance(batch, dict):
+        out = dict(batch)
+        out["image"] = image
+        return out
     if hasattr(batch, "replace"):
         return batch.replace(image=image)
     batch.image = image
     return batch
+
+
+def _prepare_batch(batch, model, device, apply_transform=False):
+    del model
+    image = _batch_image(batch)
+    if apply_transform:
+        image = _input_transform()(image)
+    return _with_image(batch, image.to(device, non_blocking=True))
 
 
 def _scores_from_predictions(predictions) -> list[float]:
@@ -183,18 +210,22 @@ def train_face(face_key: str, device) -> dict:
     for i, batch in enumerate(datamodule.train_dataloader()):
         batch = _prepare_batch(batch, model, device)
         if i == 0:
+            image = _batch_image(batch)
             print(
-                f"[{face_key}] batch image {tuple(batch.image.shape)} on {batch.image.device}",
+                f"[{face_key}] batch image {tuple(image.shape)} on {image.device}",
                 flush=True,
             )
         model.training_step(batch, 0)
-        n_seen += int(batch.image.shape[0])
+        n_seen += int(_batch_image(batch).shape[0])
     print(f"[{face_key}] 특징 추출 {n_seen}장 완료, coreset…", flush=True)
     model.fit()
     mb = getattr(model.model, "memory_bank", None)
+    if mb is None:
+        mb = getattr(model.model, "memory_bank", None)
     if mb is not None and hasattr(mb, "shape"):
         print(f"[{face_key}] coreset {tuple(mb.shape)}", flush=True)
-    model._is_fitted = torch.tensor([True], device=device)
+    if hasattr(model, "_is_fitted"):
+        model._is_fitted = torch.tensor([True], device=device)
 
     scores: list[float] = []
     model.eval()
@@ -204,16 +235,24 @@ def train_face(face_key: str, device) -> dict:
         loader = datamodule.test_dataloader() if test_n else datamodule.train_dataloader()
         for batch in loader:
             batch = _prepare_batch(batch, model, device)
-            pred = model.model(batch.image)
-            amap = getattr(pred, "anomaly_map", None)
-            if amap is None:
+            image = _batch_image(batch)
+            pred = model.model(image)
+            if isinstance(pred, dict):
+                amap = pred.get("anomaly_map")
+                raw = pred.get("pred_score")
+                if raw is None:
+                    raw = pred.get("pred_scores")
+            else:
+                amap = getattr(pred, "anomaly_map", None)
                 raw = getattr(pred, "pred_score", None)
+            if amap is None:
                 if raw is None:
                     continue
-                scores.extend(float(x) for x in raw.detach().cpu().flatten().tolist())
+                if hasattr(raw, "detach"):
+                    scores.extend(float(x) for x in raw.detach().cpu().flatten().tolist())
                 continue
-            for i in range(int(batch.image.shape[0])):
-                scores.append(masked_anomaly_score(amap[i], batch.image[i]))
+            for i in range(int(image.shape[0])):
+                scores.append(masked_anomaly_score(amap[i], image[i]))
 
     stats = _threshold(scores)
     (out / "threshold.json").write_text(json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8")

@@ -34,7 +34,7 @@ ARM_COMMANDS = ("PICK", "INSERT", "FLIP", "SORT")
 # True면 판정을 stub 항상 OK. robot_client 가 stub 으로 고정한다.
 FORCE_OK_JUDGE = False
 # True면 판정을 mock 항상 NG. 기록·그래프 확인용. FORCE_OK_JUDGE 보다 우선.
-FORCE_NG_JUDGE = True
+FORCE_NG_JUDGE = False
 
 _state = {"verdict": "OK", "judgment": None}
 
@@ -53,13 +53,21 @@ def get_judgment():
     return _state.get("judgment") or get_last_judgment()
 
 
+def begin_cycle():
+    """새 샘플 사이클 — 이전 촬영·판정이 다음 단계 응답에 실리지 않게 비운다."""
+    from inspection import reset_capture_manifests
+
+    reset_state()
+    reset_capture_manifests()
+
+
 def get_ui_snapshot():
-    """GUI·robot_client 응답용 — 판정·촬영 경로."""
+    """GUI·robot_client 응답용 — 이번 사이클 판정·촬영 경로만."""
     from inspection import get_capture_manifests
 
     return {
         "verdict": _state["verdict"],
-        "judgment": get_judgment(),
+        "judgment": _state.get("judgment"),
         "captures": get_capture_manifests(),
     }
 
@@ -183,6 +191,9 @@ def run_step(command):
     if command == "PING":
         print("[파이프라인] 통신 확인")
         return "DONE", "통신 확인"
+
+    if command == "PICK":
+        begin_cycle()
 
     if command == "GAP":
         if STAGE_GAP > 0:

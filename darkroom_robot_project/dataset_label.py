@@ -22,14 +22,24 @@ from camera import CAPTURE_DIR
 DATASET_DIR = CAPTURE_DIR / "dataset"  # 기존 sample_* 어노테이션
 OKSET_DIR = CAPTURE_DIR / "okset"  # 예전 양품수집 ok_###
 CROPSET_DIR = CAPTURE_DIR / "cropset"  # Geti 크롭 수집 crop_1, crop_2, ...
+RAWSET_DIR = CAPTURE_DIR / "rawset"  # 원본 FOV 수집. 샘플 하위 폴더 없음
+CROPPED_DIR = CAPTURE_DIR / "cropped"  # 예전 평평한 크롭 수집
+FACESET_DIR = CAPTURE_DIR / "faceset"  # 예전 면별 폴더 크롭 수집
+DEFECTSET_DIR = CAPTURE_DIR / "defectset"  # 결함 수집. 사진은 한 폴더, json 은 json/
+CROP_CUM_DIR = CAPTURE_DIR / "crop_cum"  # 운용 중 쌓는 샘플 면 크롭
+COLLECT_JSON_DIR = "json"
 LABELS_PATH = CAPTURE_DIR / "collect_labels.json"
-UNSUP_DIR = CAPTURE_DIR / "unsup"
+UNSUP_DIR = CAPTURE_DIR / "unsup"  # unsup_prepare 가 만든 학습 폴더
+UNSUPSET_DIR = CAPTURE_DIR / "unsupset"  # 비지도 양품 수집. 사진은 한 폴더, json 은 json/
 COLLECT_PREF_PATH = CAPTURE_DIR / "collect_prefs.json"
 
 NEW_PREFIX = "ok"
 NEW_NAME = re.compile(rf"{NEW_PREFIX}_(\d+)$")
 CROP_PREFIX = "crop"
 CROP_NAME = re.compile(rf"{CROP_PREFIX}_(\d+)$")
+SAMPLE_PREFIX = "sample"
+SAMPLE_NAME = re.compile(rf"{SAMPLE_PREFIX}_(\d+)$")
+CROP_CUM_FILE = re.compile(r"^crop_cum_(\d+)_\d_\d\.jpg$")
 
 TARGET_OK = 60
 MIN_OK = 30
@@ -44,9 +54,43 @@ FACES = (
     {"key": "face6_cam4_s2", "name": "면 6", "stage": 2, "cam": 4},
 )
 
+FACE_DIRS = ("면1", "면2", "면3,5", "면4", "면6")
+FACE_DIR_BY_SHOT = {
+    (1, 1): "면1",
+    (1, 2): "면2",
+    (1, 3): "면3,5",
+    (2, 3): "면3,5",
+    (1, 4): "면4",
+    (2, 4): "면6",
+}
 
-def shot_path(folder: Path, stage: int, cam: int) -> Path:
-    return folder / f"{folder.name}_{stage}_{cam}.jpg"
+
+def face_dir_name(stage: int, cam: int) -> str:
+    return FACE_DIR_BY_SHOT[(int(stage), int(cam))]
+
+
+def collect_json_dir(root: str | Path) -> Path:
+    return Path(root).expanduser() / COLLECT_JSON_DIR
+
+
+def ensure_collect_dirs(root: str | Path) -> Path:
+    folder = Path(root).expanduser()
+    folder.mkdir(parents=True, exist_ok=True)
+    collect_json_dir(folder).mkdir(parents=True, exist_ok=True)
+    return folder
+
+
+def ensure_face_dirs(root: str | Path) -> Path:
+    return ensure_collect_dirs(root)
+
+
+def face_shot_path(root: str | Path, stage: int, cam: int, sample: str) -> Path:
+    return shot_path(Path(root).expanduser(), int(stage), int(cam), sample)
+
+
+def shot_path(folder: Path, stage: int, cam: int, sample: str | None = None) -> Path:
+    prefix = sample if sample else folder.name
+    return folder / f"{prefix}_{stage}_{cam}.jpg"
 
 
 def is_complete(folder: Path) -> bool:
@@ -71,7 +115,7 @@ def load_collect_root() -> Path:
                 return Path(raw).expanduser()
         except (OSError, json.JSONDecodeError, TypeError):
             pass
-    return CROPSET_DIR
+    return UNSUPSET_DIR
 
 
 def save_collect_root(root: str | Path) -> Path:
@@ -97,6 +141,92 @@ def next_crop_name(root: str | Path | None = None) -> str:
     while number in used:
         number += 1
     return f"{CROP_PREFIX}_{number}"
+
+
+def _iter_collect_jpgs(root: Path):
+    if not root.exists():
+        return
+    for item in root.iterdir():
+        if item.is_file() and item.suffix.lower() == ".jpg" and not item.name.startswith("."):
+            yield item
+
+
+def park_collect_manifest(folder: str | Path, name: str) -> Path | None:
+    """촬영 매니페스트를 json/ 아래로 옮긴다."""
+    src = Path(folder).expanduser() / name
+    if not src.is_file():
+        dest = collect_json_dir(folder) / name
+        return dest if dest.is_file() else None
+    dest = collect_json_dir(folder) / name
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if src.resolve() != dest.resolve():
+        src.replace(dest)
+    return dest
+
+
+def next_flat_crop_name(root: str | Path | None = None, prefix: str = NEW_PREFIX) -> str:
+    """한 폴더에 쌓인 prefix_N_차_캠.jpg 다음 번호."""
+    folder = Path(root).expanduser() if root else UNSUPSET_DIR
+    used = set()
+    for item in _iter_collect_jpgs(folder):
+        match = re.match(rf"^{re.escape(prefix)}_(\d+)_[12]_\d\.jpg$", item.name)
+        if match:
+            used.add(int(match.group(1)))
+    number = 1
+    while number in used:
+        number += 1
+    return f"{prefix}_{number}"
+
+
+def collect_sample_files(root: str | Path, sample: str) -> list[Path]:
+    folder = Path(root).expanduser()
+    files: list[Path] = []
+    files.extend(collect_json_dir(folder).glob(f"{sample}_manifest_*.json"))
+    files.extend(folder.glob(f"{sample}_manifest_*.json"))
+    for item in _iter_collect_jpgs(folder):
+        if re.match(rf"^{re.escape(sample)}_[12]_\d\.jpg$", item.name):
+            files.append(item)
+    return sorted(set(files))
+
+
+def list_flat_crop_names(root: str | Path | None = None, prefix: str = NEW_PREFIX) -> list[str]:
+    folder = Path(root).expanduser() if root else UNSUPSET_DIR
+    names: set[str] = set()
+    numbered = re.compile(rf"^{re.escape(prefix)}_(\d+)$")
+    for item in _iter_collect_jpgs(folder):
+        match = re.match(rf"^({re.escape(prefix)}_\d+)_[12]_\d\.jpg$", item.name)
+        if match:
+            names.add(match.group(1))
+
+    def key(name: str):
+        match = numbered.fullmatch(name)
+        return (0, int(match.group(1))) if match else (1, name)
+
+    return sorted(names, key=key)
+
+
+def is_flat_complete(root: str | Path, sample: str) -> bool:
+    folder = Path(root).expanduser()
+    return all(shot_path(folder, face["stage"], face["cam"], sample=sample).is_file() for face in FACES)
+
+
+def list_flat_complete_names(root: str | Path, prefix: str = NEW_PREFIX) -> list[str]:
+    """한 폴더의 6면이 다 있는 ok_N 이름."""
+    return [name for name in list_flat_crop_names(root, prefix=prefix) if is_flat_complete(root, name)]
+
+
+def next_crop_cum_index() -> int:
+    """운용 수집 crop_cum_N_* 다음 번호."""
+    used = set()
+    if CROP_CUM_DIR.is_dir():
+        for item in CROP_CUM_DIR.iterdir():
+            match = CROP_CUM_FILE.fullmatch(item.name)
+            if match:
+                used.add(int(match.group(1)))
+    number = 1
+    while number in used:
+        number += 1
+    return number
 
 
 def list_crops(root: str | Path | None = None) -> list[Path]:
