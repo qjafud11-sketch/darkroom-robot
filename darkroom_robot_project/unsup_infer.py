@@ -19,6 +19,16 @@ MODELS_DIR = Path.home() / "darkroom_models" / "unsup"
 FACE_KEY = {(face["stage"], face["cam"]): face["key"] for face in FACES}
 CAM_FOR_FACE = {face["key"]: face["cam"] for face in FACES}
 STAGE_FOR_FACE = {face["key"]: face["stage"] for face in FACES}
+# 면 2 비지도 컷은 면 1과 같게 쓴다.
+THRESHOLD_FROM = {
+    "face2_cam2_s1": "face1_cam1_s1",
+}
+# 학습 컷이 이보다 낮으면 올린다. 화면 기준 9.6·9.8 → 최소 10.
+THRESHOLD_MIN = 10.0
+# 면 4 기록 NG 최고 12.82. 최소 13, 여유 두고 13.2.
+THRESHOLD_OVERRIDE = {
+    "face4_cam4_s1": 13.2,
+}
 
 _cache: dict[str, Any] = {}
 _INFER_DEVICE = None
@@ -38,12 +48,23 @@ def _infer_device():
     return _INFER_DEVICE
 
 
+def _threshold_path(face_key: str) -> Path:
+    return MODELS_DIR / THRESHOLD_FROM.get(face_key, face_key) / "threshold.json"
+
+
+def _read_threshold(face_key: str, fallback: float) -> float:
+    if face_key in THRESHOLD_OVERRIDE:
+        return float(THRESHOLD_OVERRIDE[face_key])
+    thr_path = _threshold_path(face_key)
+    if thr_path.is_file():
+        fallback = float(json.loads(thr_path.read_text(encoding="utf-8")).get("threshold") or fallback)
+    return max(float(fallback), THRESHOLD_MIN)
+
+
 def load_face(face_key: str) -> dict[str, Any]:
     if face_key in _cache:
         bundle = _cache[face_key]
-        thr_path = MODELS_DIR / face_key / "threshold.json"
-        if thr_path.is_file():
-            bundle["threshold"] = float(json.loads(thr_path.read_text(encoding="utf-8")).get("threshold") or bundle["threshold"])
+        bundle["threshold"] = _read_threshold(face_key, bundle["threshold"])
         return bundle
     root = MODELS_DIR / face_key
     meta_path = root / "model.json"
@@ -56,10 +77,7 @@ def load_face(face_key: str) -> dict[str, Any]:
         if not found:
             raise FileNotFoundError(f"ckpt 없음: {root}")
         ckpt = found[0]
-    thr_path = root / "threshold.json"
-    threshold = float(meta.get("threshold") or 1.0)
-    if thr_path.is_file():
-        threshold = float(json.loads(thr_path.read_text(encoding="utf-8")).get("threshold") or threshold)
+    threshold = _read_threshold(face_key, float(meta.get("threshold") or 1.0))
 
     from anomalib.models import Patchcore
 

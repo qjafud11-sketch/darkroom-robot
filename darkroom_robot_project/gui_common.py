@@ -156,6 +156,11 @@ def split_judge_items(judgment: dict | None) -> tuple[list, list]:
     return unsup, yolo
 
 
+def unsup_ng_items(items: list) -> list:
+    """비지도 로그용 — NG 면만."""
+    return [row for row in items if row.get("ng")]
+
+
 def yolo_category_summary(items: list) -> str:
     counts = Counter()
     for item in items:
@@ -1120,16 +1125,18 @@ class RecordDetailPanel(Frame):
         self.inspect_wall.set_judgment(judgment)
 
         unsup_items, yolo_items = split_judge_items(judgment)
-        self._unsup_items = unsup_items
+        unsup_ng = unsup_ng_items(unsup_items)
+        self._unsup_items = unsup_ng
         self._yolo_items = yolo_items
-        self._list_items = unsup_items + yolo_items
+        self._list_items = unsup_ng + yolo_items
         self.unsup_list.delete(0, END)
         self.yolo_list.delete(0, END)
-        if unsup_items:
-            ng_n = sum(1 for item in unsup_items if item.get("ng"))
-            self.unsup_summary.set(f"{len(unsup_items)}면 · 이상 {ng_n}면 · 선택 시 위치 강조")
-            for item in unsup_items:
+        if unsup_ng:
+            self.unsup_summary.set(f"이상 {len(unsup_ng)}면 · 선택 시 위치 강조")
+            for item in unsup_ng:
                 self.unsup_list.insert(END, defect_line(item))
+        elif unsup_items:
+            self.unsup_summary.set("이상 없음")
         else:
             self.unsup_summary.set("이번 판정 없음")
         if yolo_items:
@@ -2371,16 +2378,18 @@ class OperatorPanel(Card):
         if inspect_wall is not None:
             self.inspect_wall = inspect_wall
         unsup_items, yolo_items = split_judge_items(judgment)
-        self.unsup_items = unsup_items
+        unsup_ng = unsup_ng_items(unsup_items)
+        self.unsup_items = unsup_ng
         self.yolo_items = yolo_items
-        self.list_items = unsup_items + yolo_items
+        self.list_items = unsup_ng + yolo_items
         self.unsup_list.delete(0, END)
         self.yolo_list.delete(0, END)
-        if unsup_items:
-            ng_n = sum(1 for item in unsup_items if item.get("ng"))
-            self.unsup_summary.set(f"{len(unsup_items)}면 · 이상 {ng_n}면 · 선택 시 위치 강조")
-            for item in unsup_items:
+        if unsup_ng:
+            self.unsup_summary.set(f"이상 {len(unsup_ng)}면 · 선택 시 위치 강조")
+            for item in unsup_ng:
                 self.unsup_list.insert(END, defect_line(item))
+        elif unsup_items:
+            self.unsup_summary.set("이상 없음")
         else:
             self.unsup_summary.set("이번 판정 없음")
         if yolo_items:
