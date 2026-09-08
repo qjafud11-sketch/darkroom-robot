@@ -183,6 +183,22 @@ def camera_slots():
     ]
 
 
+def extra_capture_nodes():
+    """검사 슬롯 1~4에 안 들어간 캡처 노드. 실시간 프리뷰용."""
+    extras = []
+    for usb, device in _iter_capture_nodes():
+        if usb in PREFERRED_USB:
+            continue
+        extras.append(
+            {
+                "usb": usb,
+                "device": device,
+                "name": f"추가 카메라  USB {usb}",
+            }
+        )
+    return extras
+
+
 def report(log=print):
     serials = _serial_devices()
     if serials:

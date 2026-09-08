@@ -188,8 +188,10 @@ def _copy_inspect_folder(src_folder: str, dest: Path, label: str) -> str:
     return str(dest)
 
 
-def preview_source_and_boxes(judgment: dict[str, Any]) -> tuple[str, list[list[int]], int, str]:
-    """전체 화면 미리보기용 촬영본과 bbox. 크롭 좌표는 쓰지 않는다."""
+def preview_source_and_boxes(
+    judgment: dict[str, Any], *, use_crop: bool = False,
+) -> tuple[str, list[list[int]], int, str]:
+    """미리보기용 촬영본과 박스. use_crop이면 crop_bbox."""
     defects = judgment.get("defects") or []
     if defects:
         item = defects[0]
@@ -202,7 +204,7 @@ def preview_source_and_boxes(judgment: dict[str, Any]) -> tuple[str, list[list[i
             for d in defects
             if d.get("inspect") == inspect and int(d.get("cam_id", 0)) == cam_id
         ]
-        bboxes = merge_unsup_yolo_boxes(face_items, use_crop=False)
+        bboxes = merge_unsup_yolo_boxes(face_items, use_crop=use_crop)
         if manifest:
             for cam in manifest.get("cameras") or []:
                 path = image_path_from_cam(cam)

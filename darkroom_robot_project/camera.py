@@ -41,6 +41,30 @@ INSPECT_CAM_IDS = {
 CAMERAS = camera_slots()
 
 
+def listed_cameras():
+    """캘리브·화각용. 검사 슬롯 1~4와 추가로 꽂힌 캡처 노드."""
+    from hw_ports import extra_capture_nodes
+
+    cams = list(camera_slots())
+    used = {cam.get("device") for cam in cams if cam.get("device")}
+    next_id = 5
+    for extra in extra_capture_nodes():
+        device = extra.get("device")
+        if not device or device in used:
+            continue
+        cams.append(
+            {
+                "id": next_id,
+                "name": f"카메라 {next_id}",
+                "device": device,
+                "usb": extra.get("usb"),
+            }
+        )
+        used.add(device)
+        next_id += 1
+    return cams
+
+
 def connected_cameras():
     """장치가 있는 슬롯만."""
     out = []
@@ -79,12 +103,16 @@ def read_png(stream):
 
 
 class LiveCamera:
-    """프리뷰용. 저장 촬영은 grab_stills가 고해상도로 따로 찍는다."""
+    """프리뷰용. 저장 촬영은 grab_stills가 고해상도로 따로 찍는다.
 
-    def __init__(self, width=320, height=240, fps=5):
+    raw=True 이면 PNG 인코딩 없이 RGB 바이트를 넘긴다. 실시간 칸에 쓴다.
+    """
+
+    def __init__(self, width=320, height=240, fps=5, raw=False):
         self.width = width
         self.height = height
         self.fps = fps
+        self.raw = raw
         self.frames = queue.Queue(maxsize=1)
         self.process = None
         self.thread = None
@@ -96,18 +124,28 @@ class LiveCamera:
         self.stop()
         self.device = device
         self.last_error = ""
+        size = f"{self.width}x{self.height}"
         command = [
             "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-fflags", "nobuffer", "-flags", "low_delay",
             "-f", "v4l2", "-input_format", "mjpeg",
-            "-video_size", f"{self.width}x{self.height}", "-framerate", str(self.fps),
+            "-video_size", size, "-framerate", str(self.fps),
             "-i", device,
-            "-vf", f"scale={self.width}:{self.height}",
-            "-f", "image2pipe", "-vcodec", "png", "-",
         ]
+        if self.raw:
+            command += [
+                "-an", "-vf", f"scale={self.width}:{self.height}",
+                "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
+            ]
+        else:
+            command += [
+                "-vf", f"scale={self.width}:{self.height}",
+                "-f", "image2pipe", "-vcodec", "png", "-",
+            ]
         self.process = subprocess.Popen(
             command,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
             bufsize=0,
         )
         self.running = True
@@ -118,7 +156,10 @@ class LiveCamera:
         assert self.process is not None and self.process.stdout is not None
         try:
             while self.running:
-                frame = read_png(self.process.stdout)
+                if self.raw:
+                    frame = _read_exact(self.process.stdout, self.width * self.height * 3)
+                else:
+                    frame = read_png(self.process.stdout)
                 try:
                     self.frames.get_nowait()
                 except queue.Empty:
@@ -126,10 +167,7 @@ class LiveCamera:
                 self.frames.put_nowait(frame)
         except (EOFError, ValueError, OSError) as exc:
             if self.running:
-                detail = ""
-                if self.process.stderr is not None:
-                    detail = self.process.stderr.read().decode("utf-8", errors="replace").strip()
-                self.last_error = detail.splitlines()[-1] if detail else str(exc)
+                self.last_error = str(exc)
         finally:
             self.running = False
 

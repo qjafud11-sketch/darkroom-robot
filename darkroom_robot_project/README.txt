@@ -121,6 +121,10 @@
     3. 파이에서 ping <NUC_IP> 가 되면 통신 준비 완료
 
   실행 순서
+    같은 PC에서 UI+실행기:
+      ./start_inspect.sh              검사 창과 robot_client를 같이 켠다
+      ./start_inspect.sh --stop       둘만 종료 (수집 UI는 건드리지 않음)
+    나눠서 켤 때:
     1. PC   : python gui_server.py     (먼저 켜서 대기)
     2. 파이 : python robot_client.py   (NUC에 접속)
     3. GUI에 "라즈베리파이가 연결되었습니다" 가 뜨면 버튼 사용

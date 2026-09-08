@@ -55,10 +55,11 @@ def get_judgment():
 
 def begin_cycle():
     """새 샘플 사이클 — 이전 촬영·판정이 다음 단계 응답에 실리지 않게 비운다."""
-    from inspection import reset_capture_manifests
+    from inspection import hold_cam3_light, reset_capture_manifests
 
     reset_state()
     reset_capture_manifests()
+    hold_cam3_light(True)
 
 
 def get_ui_snapshot():
@@ -183,6 +184,8 @@ PIPELINE_COMMANDS = (
     "JUDGE",
     "CALIB",
     "AI",
+    "LIGHT_HOLD_ON",
+    "LIGHT_HOLD_OFF",
 )
 
 
@@ -191,6 +194,18 @@ def run_step(command):
     if command == "PING":
         print("[파이프라인] 통신 확인")
         return "DONE", "통신 확인"
+
+    if command == "LIGHT_HOLD_ON":
+        from inspection import hold_cam3_light
+
+        hold_cam3_light(True)
+        return "DONE", "카메라3 상시 조명 ON"
+
+    if command == "LIGHT_HOLD_OFF":
+        from inspection import hold_cam3_light
+
+        hold_cam3_light(False)
+        return "DONE", "카메라3 상시 조명 OFF"
 
     if command == "PICK":
         begin_cycle()

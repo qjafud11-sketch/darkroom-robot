@@ -18,6 +18,9 @@ from servo import rotate_180 as servo_rotate_180
 # 노출을 못 올린다. 톤을 맞추면 세 채널이 같이 차서 같은 전류로 더 밝게 찍힌다.
 LED_ON = light_command()
 LED_OFF = "OFF"
+# 검사 시퀀스가 돌아가는 동안 카메라 3 방향(R3)만 약하게 켠다.
+CAM3_HOLD_ON = "R3:10"
+CAM3_HOLD_OFF = "R3:0"
 LIGHT_ON = 2.0
 # 보드 OK 만으로는 하중 있는 거치대가 180°를 다 돌기 전에 촬영이 들어가
 # 2차 사진이 1차와 거의 같아졌다. 촬영 전에 이만큼 더 기다린다.
@@ -33,6 +36,16 @@ def _need(reply, board, command):
     return reply
 
 
+def hold_cam3_light(on: bool):
+    """카메라 3 방향 링만 밝기 10으로 켜거나 끈다."""
+    cmd = CAM3_HOLD_ON if on else CAM3_HOLD_OFF
+    try:
+        _need(send_ok(cmd), "조명", cmd)
+        print(f"[조명] 카메라3 상시 {'ON' if on else 'OFF'}  {cmd}")
+    except Exception as exc:
+        print(f"[조명] 카메라3 상시 실패: {exc}")
+
+
 def control_led(cmd):
     """조명 켜기/끄기. FTDI 보드 OK를 기다린다."""
     if cmd == "LED_ON":
@@ -41,6 +54,7 @@ def control_led(cmd):
     elif cmd == "LED_OFF":
         print(f"[조명] OFF  {resolve_port()}")
         _need(send_ok(LED_OFF), "조명", LED_OFF)
+        hold_cam3_light(True)
 
 
 def get_capture_manifests():

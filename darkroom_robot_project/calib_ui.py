@@ -19,7 +19,7 @@ from PIL import Image, ImageTk
 
 from arduino_link import LIGHT_BRIGHTNESS, LIGHT_MAX, resolve_port, send_ok
 from light_tone import LIGHT_TONE_K, light_command
-from camera import CAMERAS, LiveCamera
+from camera import listed_cameras, LiveCamera
 from camera_calib import (
     FILTER_DEFAULTS,
     FILTER_LIMITS,
@@ -61,7 +61,7 @@ class CalibUi:
         self._pending = None
         self.stopped = False
         self.light_brightness = tk.StringVar(value=str(LIGHT_BRIGHTNESS))
-        self.status = tk.StringVar(value="카메라 1~4 중 한 대를 누르면 그 대만 켭니다.")
+        self.status = tk.StringVar(value="카메라 한 대를 누르면 그 대만 켭니다. 추가 카메라도 목록에 있습니다.")
 
         self._build()
         threading.Thread(target=self._preview_loop, daemon=True).start()
@@ -90,13 +90,14 @@ class CalibUi:
 
         cams = Frame(self.root)
         cams.pack(fill="x", padx=10, pady=6)
-        for cam in CAMERAS:
+        for cam in listed_cameras():
             connected = bool(cam.get("device"))
-            text = cam["name"] if connected else f"{cam['name']}  ·  미연결"
+            extra = f"  USB {cam['usb']}" if cam.get("usb") else ""
+            text = f"{cam['name']}{extra}" if connected else f"{cam['name']}  ·  미연결"
             btn = tk.Button(
                 cams,
                 text=text,
-                width=18,
+                width=20,
                 height=2,
                 state=NORMAL if connected else DISABLED,
                 command=lambda c=cam: self.select(c),
@@ -124,7 +125,7 @@ class CalibUi:
         preview_wrap = Frame(body, bd=1, relief="solid")
         preview_wrap.pack(side="left", fill="both", expand=True, padx=(0, 8))
         tk.Label(preview_wrap, text="고른 카메라만 켭니다", font=("Arial", 10, "bold")).pack(pady=(6, 0))
-        self.preview = Label(preview_wrap, text="대기 — 1~4 중 한 대만 선택", bg="#222", fg="#ddd")
+        self.preview = Label(preview_wrap, text="대기 — 카메라 한 대만 선택", bg="#222", fg="#ddd")
         self.preview.pack(fill="both", expand=True, padx=8, pady=8)
 
         right = Frame(body, width=420)
@@ -169,6 +170,10 @@ class CalibUi:
             if saved:
                 set_controls(cam["device"], saved)
             self._rebuild_controls()
+            # 추가 C270은 1280x960이 없다. 검사 촬영과 같은 720p를 연다.
+            if int(cam.get("id") or 0) >= 5:
+                self.live.stop()
+                self.live = LiveCamera(width=1280, height=720, fps=15)
             self.live.start(cam["device"])
             extra = "저장값 적용" if saved else "장치 현재값"
             self.status.set(f"{cam['name']}  {cam['device']}  ·  {extra}")

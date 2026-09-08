@@ -101,4 +101,12 @@ if __name__ == "__main__":
             print("[실행기] 팔 준비 — 불량분류 J1=1050 허용")
         except Exception as exc:
             print(f"[실행기] 팔 준비 실패: {exc}", flush=True)
-    run_client()
+    try:
+        run_client()
+    finally:
+        try:
+            from inspection import hold_cam3_light
+
+            hold_cam3_light(False)
+        except Exception:
+            pass

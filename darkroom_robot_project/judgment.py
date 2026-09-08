@@ -55,8 +55,9 @@ class JudgmentResult:
 
 
 _YOLO_CLASSES = {"scratch", "dent"}
-_BOX_MERGE_IOU = 0.25
-_BOX_MERGE_IOS = 0.45
+# 비지도가 YOLO와 이 비율 이상 겹치면 비지도 박스는 그리지 않는다. YOLO 박스는 그대로 둔다.
+_BOX_MERGE_IOU = 0.50
+_BOX_MERGE_IOS = 0.50
 
 
 def _as_box(raw) -> list[float] | None:
@@ -119,7 +120,10 @@ def box_union(a, b) -> list[float]:
 
 
 def merge_unsup_yolo_boxes(items: list[dict[str, Any]], *, use_crop: bool = False) -> list[list[int]]:
-    """같은 면의 비지도·YOLO 박스가 같은 영역이면 합집합 하나."""
+    """표시용 박스. YOLO를 우선하고, 비지도는 YOLO와 50% 이상 겹치면 생략한다.
+
+    예전처럼 합집합을 만들면 한 면의 스크래치·찌그러짐이 큰 이상맵에 삼켜진다.
+    """
     unsup: list[list[float]] = []
     yolo: list[list[float]] = []
     other: list[list[float]] = []
@@ -135,24 +139,13 @@ def merge_unsup_yolo_boxes(items: list[dict[str, Any]], *, use_crop: bool = Fals
             unsup.append(box)
         else:
             other.append(box)
-    used = [False] * len(yolo)
     out: list[list[int]] = []
+    for y in yolo:
+        out.append([int(round(v)) for v in y])
     for u in unsup:
-        acc = list(u)
-        changed = True
-        while changed:
-            changed = False
-            for i, y in enumerate(yolo):
-                if used[i]:
-                    continue
-                if boxes_same_region(acc, y):
-                    acc = box_union(acc, y)
-                    used[i] = True
-                    changed = True
-        out.append([int(round(v)) for v in acc])
-    for i, y in enumerate(yolo):
-        if not used[i]:
-            out.append([int(round(v)) for v in y])
+        if any(boxes_same_region(u, y) for y in yolo):
+            continue
+        out.append([int(round(v)) for v in u])
     out.extend([int(round(v)) for v in box] for box in other)
     return out
 

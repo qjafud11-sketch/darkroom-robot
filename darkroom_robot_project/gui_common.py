@@ -30,7 +30,7 @@ from tkinter import font as tkfont
 
 from PIL import Image, ImageDraw, ImageTk
 
-from camera import CAMERAS, CAPTURE_DIR, connected_cameras
+from camera import CAMERAS, CAPTURE_DIR, LiveCamera, connected_cameras
 from judgment import (
     RESULT_PATH,
     image_path_from_cam,
@@ -429,8 +429,8 @@ def _open_rgb_draft(path, max_size=None) -> tuple[Image.Image, tuple[int, int]]:
     return img.convert("RGB"), native
 
 
-def _load_wall_image(path, cam_id=None, inspect=None, crop=None, max_size=None) -> tuple[Image.Image, tuple[int, int]]:
-    """표시 이미지와 박스 좌표계 크기. 판정과 같은 open_camera_rgb / 크롭을 쓴다."""
+def _load_wall_image(path, cam_id=None, inspect=None, crop=None, max_size=None):
+    """표시 이미지, 박스 좌표계 크기, 실제 크롭 여부."""
     from sample_roi import SampleNotFound, crop_camera, show_gui_sample_crop
 
     want_crop = show_gui_sample_crop() if crop is None else bool(crop)
@@ -441,60 +441,77 @@ def _load_wall_image(path, cam_id=None, inspect=None, crop=None, max_size=None) 
         cached = _CROP_PREVIEW_CACHE.get(key)
         if cached is not None:
             img = cached.copy()
-            return img, img.size
+            return img, img.size, True
         try:
             _rgb, result = crop_camera(path, int(cam_id), stage=inspect_stage(inspect))
             img = result.image.convert("RGB")
             _cache_put(_CROP_PREVIEW_CACHE, key, img, 24)
-            return img.copy(), img.size
+            return img.copy(), img.size, True
         except (SampleNotFound, OSError, FileNotFoundError):
             pass
     if cam_id is not None:
         from camera_calib import inspect_stage, open_camera_rgb
 
         rgb = open_camera_rgb(path, int(cam_id), stage=inspect_stage(inspect))
-        return rgb, rgb.size
-    return _open_rgb_draft(path, max_size)
+        return rgb, rgb.size, False
+    img, native = _open_rgb_draft(path, max_size)
+    return img, native, False
 
 
-def render_image(path, bboxes=None, highlight_idx=-1, size=CELL_SIZE, cam_id=None, inspect=None, crop=None):
+def render_image(
+    path,
+    bboxes=None,
+    highlight_idx=-1,
+    size=CELL_SIZE,
+    cam_id=None,
+    inspect=None,
+    crop=None,
+    items=None,
+):
     from sample_roi import show_gui_sample_crop
 
     mtime = Path(path).stat().st_mtime_ns
     want_crop = show_gui_sample_crop() if crop is None else bool(crop)
-    # 박스가 있으면 JPEG draft를 쓰지 않는다. 디코드 크기와 좌표 공간이 어긋난다.
-    decode_size = None if bboxes else size
-    rgb_key = (str(path), mtime, cam_id, str(inspect or ""), want_crop, tuple(size), bool(bboxes))
+    decode_size = None if (bboxes or items) else size
+    rgb_key = (str(path), mtime, cam_id, str(inspect or ""), want_crop, tuple(size), bool(bboxes or items))
     cached = _WALL_RGB_CACHE.get(rgb_key)
     if cached is None:
-        img, orig_size = _load_wall_image(
+        img, orig_size, used_crop = _load_wall_image(
             path, cam_id=cam_id, inspect=inspect, crop=crop, max_size=decode_size,
         )
         img.thumbnail(size, Image.BILINEAR)
-        _cache_put(_WALL_RGB_CACHE, rgb_key, (img, orig_size))
+        _cache_put(_WALL_RGB_CACHE, rgb_key, (img, orig_size, used_crop))
     else:
-        img, orig_size = cached
+        img, orig_size, used_crop = cached
+    if items is not None:
+        bboxes = merge_unsup_yolo_boxes(items, use_crop=used_crop)
     work = img.copy()
     _overlay_bboxes(work, bboxes, highlight_idx, orig_size=orig_size)
     return ImageTk.PhotoImage(work)
 
 
-def render_judgment_preview(judgment, size, highlight_idx=-1):
-    """기록·리포트 미리보기. 전체 화면 좌표 bbox를 촬영본에 그린다."""
+def render_judgment_preview(judgment, size, highlight_idx=-1, crop=True):
+    """기록·리포트 미리보기. 기본은 샘플 크롭 + crop_bbox."""
     from ui_store import preview_source_and_boxes
 
-    src, boxes, cam_id, inspect = preview_source_and_boxes(judgment)
+    src, _boxes, cam_id, inspect = preview_source_and_boxes(judgment, use_crop=crop)
     if not src or not Path(src).is_file():
         return None
+    defects = judgment.get("defects") or []
+    items = [
+        d
+        for d in defects
+        if d.get("inspect") == inspect and int(d.get("cam_id", 0)) == int(cam_id or 0)
+    ]
     try:
         return render_image(
             src,
-            boxes,
             highlight_idx=highlight_idx,
             size=size,
             cam_id=cam_id or None,
             inspect=inspect,
-            crop=False,
+            crop=crop,
+            items=items,
         )
     except OSError:
         return None
@@ -532,6 +549,117 @@ class Card(Frame):
             pady=pady,
             **kwargs,
         )
+
+
+class ExtraCamPreview(Frame):
+    """검사 슬롯 밖 카메라 실시간 보기. 상태 카드 오른쪽에 맞춘 크기."""
+
+    # C270은 320x180을 지원하지 않는다. 캡처는 네이티브 320x240, 표시만 칸에 맞춘다.
+    CAPTURE = (320, 240)
+    VIEW = (320, 180)
+    FPS = 15
+
+    def __init__(self, parent):
+        super().__init__(parent, bg=COLORS["bg_root"], width=self.VIEW[0] + 28)
+        self.pack_propagate(False)
+        self._live: LiveCamera | None = None
+        self._photo = None
+        self._job = None
+        self._device = ""
+        self._paused = False
+
+        card = Card(self, padx=10, pady=8)
+        card.pack(fill="both", expand=True)
+        Label(
+            card, text="실시간 프리뷰", font=FONT_HEAD,
+            fg=COLORS["text_primary"], bg=COLORS["bg_card"],
+        ).pack(anchor="w")
+        self._sub = StringVar(value="추가 카메라 찾는 중")
+        Label(
+            card, textvariable=self._sub, font=FONT_SMALL,
+            fg=COLORS["text_dim"], bg=COLORS["bg_card"],
+        ).pack(anchor="w", pady=(0, 6))
+        host = Frame(card, bg=COLORS["bg_cell"], width=self.VIEW[0], height=self.VIEW[1])
+        host.pack(fill="both", expand=True)
+        host.pack_propagate(False)
+        self._img = Label(
+            host, text="대기", bg=COLORS["bg_cell"], fg=COLORS["text_dim"],
+        )
+        self._img.pack(fill="both", expand=True)
+        self.after(80, self._boot)
+        self.bind("<Destroy>", lambda _e: self.shutdown())
+
+    def _boot(self):
+        from hw_ports import extra_capture_nodes
+
+        nodes = extra_capture_nodes()
+        if not nodes:
+            self._sub.set("추가 카메라 없음")
+            self._img.config(text="미연결")
+            return
+        node = nodes[0]
+        self._device = node["device"]
+        self._sub.set(f"{node['name']}  ·  {Path(self._device).name}")
+        try:
+            self._live = LiveCamera(
+                width=self.CAPTURE[0], height=self.CAPTURE[1], fps=self.FPS, raw=True,
+            )
+            self._live.start(self._device)
+        except Exception as exc:
+            self._img.config(text=str(exc))
+            return
+        self._poll()
+
+    def pause(self):
+        self._paused = True
+        if self._live is not None:
+            self._live.stop()
+
+    def resume(self):
+        if self._paused and self._device and self._live is not None:
+            try:
+                self._live.start(self._device)
+            except Exception:
+                pass
+        self._paused = False
+
+    def _poll(self):
+        if not self.winfo_exists():
+            return
+        live = self._live
+        if live is not None and not self._paused:
+            frame = None
+            try:
+                while True:
+                    frame = live.frames.get_nowait()
+            except Exception:
+                pass
+            if frame:
+                try:
+                    if live.raw:
+                        img = Image.frombytes("RGB", self.CAPTURE, frame)
+                    else:
+                        img = Image.open(BytesIO(frame)).convert("RGB")
+                    img.thumbnail(self.VIEW, Image.BILINEAR)
+                    self._photo = ImageTk.PhotoImage(img)
+                    self._img.config(image=self._photo, text="")
+                except (OSError, ValueError):
+                    pass
+            elif live.last_error:
+                self._img.config(image="", text=live.last_error)
+                live.last_error = ""
+        self._job = self.after(50, self._poll)
+
+    def shutdown(self):
+        if self._job is not None:
+            try:
+                self.after_cancel(self._job)
+            except tk.TclError:
+                pass
+            self._job = None
+        if self._live is not None:
+            self._live.stop()
+            self._live = None
 
 
 _ROUND_CACHE: dict[tuple, ImageTk.PhotoImage] = {}
@@ -847,7 +975,7 @@ class RecordDetailPanel(Frame):
         self.wall_host = Frame(body, bg=COLORS["bg_card"])
         self.wall_host.pack(fill="x", padx=4)
         self.inspect_wall = InspectWall(
-            self.wall_host, cell_size=(228, 128), auto_pack=False, show_header=False, use_sample_crop=False,
+            self.wall_host, cell_size=(228, 128), auto_pack=False, show_header=False, use_sample_crop=True,
         )
         self.inspect_wall.pack(fill="x")
 
@@ -2421,7 +2549,8 @@ class InspectWall(Frame):
                     if int(cam.get("id", 0)) == cam_id:
                         path = image_path_from_cam(cam)
                         break
-            bboxes = self._defects_for(inspect, cam_id)
+            items = self._items_for(inspect, cam_id)
+            bboxes = merge_unsup_yolo_boxes(items, use_crop=self._crop_enabled())
             highlight_idx = -1
             if highlight:
                 h_inspect, h_cam, h_idx = highlight
@@ -2446,12 +2575,12 @@ class InspectWall(Frame):
                 try:
                     photo = render_image(
                         path,
-                        bboxes,
-                        highlight_idx,
-                        self.cell_size,
+                        highlight_idx=highlight_idx,
+                        size=self.cell_size,
                         cam_id=cam_id,
                         inspect=inspect,
                         crop=self._crop_enabled(),
+                        items=items,
                     )
                     self.photos[key] = photo
                     self._cell_sig[key] = sig

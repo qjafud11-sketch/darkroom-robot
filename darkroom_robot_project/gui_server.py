@@ -11,6 +11,7 @@ from gui_common import (
     COLORS,
     AppHeader,
     Card,
+    ExtraCamPreview,
     InspectWall,
     OperatorPanel,
     PhaseHeader,
@@ -44,6 +45,7 @@ operator = None
 phase_header = None
 timeline = None
 inspect_wall = None
+extra_preview = None
 
 is_running = False
 stop_requested = False
@@ -197,6 +199,16 @@ def _on_step_done(resp):
     apply_snapshot(resp)
 
 
+def _send_light_hold(on: bool):
+    """타임라인에 안 올리고 카메라3 상시 조명만 켠다/끈다."""
+    if server.conn is None:
+        return
+    try:
+        server.send("LIGHT_HOLD_ON" if on else "LIGHT_HOLD_OFF")
+    except Exception as exc:
+        print(f"[UI] 카메라3 상시 조명 실패: {exc}")
+
+
 def send_step(cmd):
     if server.conn is None:
         _on_ui(lambda: phase_header.set_phase(
@@ -297,6 +309,7 @@ def run_sequence_worker(sequence=None, clear_inspect=None, reset_verdict=True):
     is_running = False
     stop_requested = False
     cycle_stop_requested = False
+    _send_light_hold(False)
     _on_ui(lambda: _set_controls(idle=True))
 
 
@@ -315,6 +328,7 @@ def start_run(sequence=None, clear_inspect=None, reset_verdict=True):
     stop_requested = False
     cycle_stop_requested = False
     _set_controls(idle=False)
+    _send_light_hold(True)
     threading.Thread(
         target=run_sequence_worker,
         kwargs={
@@ -425,6 +439,8 @@ def load_saved_judgment():
 
 
 def grab_for_pipeline(label):
+    # 추가 프리뷰(USB 포트 6)는 검사 카메라(허브 5.x)와 장치가 다르다.
+    # 일부러 멈추지 않는다. 720p를 한 대씩만 열어 대역은 여유가 있다.
     manifest = grab_stills(label, cam_ids=cam_ids_for_label(label))
     folder = manifest["folder"]
     _on_ui(lambda: inspect_wall and inspect_wall.load_capture_folders({label: folder}))
@@ -469,7 +485,7 @@ def on_nav(name):
 def build_ui():
     global root, app_header, sidebar, body, center_stack
     global inspect_page, records_page, reports_page, settings_page
-    global phase_header, timeline, operator, inspect_wall
+    global phase_header, timeline, operator, inspect_wall, extra_preview
 
     root = tk.Tk()
     root.title("Darkroom Vision — 운영")
@@ -488,12 +504,16 @@ def build_ui():
     center_stack.pack(side="left", fill="both", expand=True)
 
     inspect_page = tk.Frame(center_stack, bg=COLORS["bg_root"])
-    status_card = Card(inspect_page, padx=14, pady=12)
-    status_card.pack(fill="x", padx=8, pady=(8, 4))
+    top_row = tk.Frame(inspect_page, bg=COLORS["bg_root"])
+    top_row.pack(fill="x", padx=8, pady=(8, 4))
+    status_card = Card(top_row, padx=14, pady=12)
+    status_card.pack(side="left", fill="both", expand=True)
     phase_header = PhaseHeader(status_card)
     phase_header.pack(fill="x")
     timeline = TimelineStrip(status_card)
     timeline.pack(fill="x", pady=(10, 0))
+    extra_preview = ExtraCamPreview(top_row)
+    extra_preview.pack(side="right", fill="y", padx=(8, 0))
     inspect_wall = InspectWall(inspect_page, use_sample_crop=False)
 
     records_page = RecordsPage(
@@ -525,6 +545,8 @@ def build_ui():
 
 
 def on_close():
+    if extra_preview is not None:
+        extra_preview.shutdown()
     try:
         flush_archives_to_stats()
     except Exception as exc:
